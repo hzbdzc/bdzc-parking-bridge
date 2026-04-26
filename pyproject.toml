@@ -1,0 +1,21 @@
+[project]
+name = "bdzc_parking"
+version = "0.1.0"
+description = "Hikvision parking event bridge for Boda parking integration"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "PySide6>=6.11,<7",
+]
+
+[project.scripts]
+bdzc_parking = "bdzc_parking.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
