@@ -67,7 +67,10 @@ CONFIG_FIELD_GROUPS = [
             "local_entry_cname",
         ),
     ),
-    ("桥接与发送", ("retry_count", "retry_delay_seconds", "request_timeout_seconds", "max_event_age_seconds")),
+    (
+        "桥接与发送",
+        ("retry_count", "retry_delay_seconds", "request_timeout_seconds", "max_event_age_seconds", "event_page_size"),
+    ),
 ]
 
 
@@ -90,6 +93,7 @@ CONFIG_FIELD_LABELS = {
     "retry_delay_seconds": "重试间隔秒",
     "request_timeout_seconds": "请求超时秒",
     "max_event_age_seconds": "过旧跳过秒数",
+    "event_page_size": "每页记录数",
     "db_path": "数据库路径",
     "log_path": "日志路径",
 }
@@ -113,6 +117,7 @@ CONFIG_FIELD_TOOLTIPS = {
     "retry_delay_seconds": "每次重试之间等待的秒数。",
     "request_timeout_seconds": "向大园区 API 发起 HTTP 请求时的超时秒数，必须大于 0。",
     "max_event_age_seconds": "过车时间相对收到时间超过这个秒数时，自动跳过发送，但仍会保留记录。",
+    "event_page_size": "主列表每页显示的记录数；默认 1000，翻页可查看更旧记录。",
     "db_path": "SQLite 数据库文件路径；可通过配置文件修改，变更后需要重启程序生效。",
     "log_path": "程序日志文件路径；可通过配置文件修改，变更后需要重启程序生效。",
 }
@@ -128,6 +133,7 @@ DIRECTION_LABELS = {
 PASSING_TYPE_LABELS = {
     "plateRecognition": "车牌识别",
     "stop": "停车触发",
+    "manual": "手动放行",
 }
 
 STATUS_LABELS = {
@@ -448,7 +454,7 @@ class ConfigDialog(QDialog):
                     continue
                 raise ValueError(f"{key} 不能为空")
             try:
-                if key in {"listen_port", "retry_count"}:
+                if key in {"listen_port", "retry_count", "event_page_size"}:
                     values[key] = int(text)
                 elif key in {"retry_delay_seconds", "request_timeout_seconds", "max_event_age_seconds"}:
                     values[key] = float(text)
@@ -1054,6 +1060,8 @@ class MainWindow(QMainWindow):
         self.service = service
         self.store = store
         self.last_selected_event_id: int | None = None
+        self.current_page_index = 0
+        self.total_event_count = 0
         self.sort_column = 0
         self.sort_order = Qt.SortOrder.DescendingOrder
         self.signals = BridgeSignals()
@@ -1213,6 +1221,25 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.exit_button)
         top_bar.addStretch(1)
 
+        self.first_page_button = QPushButton("首页")
+        self.prev_page_button = QPushButton("上一页")
+        self.next_page_button = QPushButton("下一页")
+        self.last_page_button = QPushButton("末页")
+        self.page_info_label = QLabel()
+        self.first_page_button.clicked.connect(self.go_first_page)
+        self.prev_page_button.clicked.connect(self.go_previous_page)
+        self.next_page_button.clicked.connect(self.go_next_page)
+        self.last_page_button.clicked.connect(self.go_last_page)
+
+        page_bar = QHBoxLayout()
+        page_bar.addWidget(self.first_page_button)
+        page_bar.addWidget(self.prev_page_button)
+        page_bar.addWidget(self.next_page_button)
+        page_bar.addWidget(self.last_page_button)
+        page_bar.addSpacing(12)
+        page_bar.addWidget(self.page_info_label)
+        page_bar.addStretch(1)
+
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["ID", "过车时间", "车牌", "方向", "通道", "类型", "状态/次数/原因", "返回信息"]
@@ -1248,6 +1275,7 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addLayout(top_bar)
+        layout.addLayout(page_bar)
         layout.addWidget(splitter, 1)
 
         container = QWidget()
@@ -1287,6 +1315,7 @@ class MainWindow(QMainWindow):
             raise
 
         self.last_selected_event_id = None
+        self.current_page_index = 0
         self.detail_panel.clear()
         self.refresh_table()
         self._update_buttons()
@@ -1348,6 +1377,49 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "启动失败", str(exc))
         self._update_buttons()
 
+    def go_first_page(self) -> None:
+        """跳转到最新记录所在的第一页。"""
+        self._set_page(0)
+
+    def go_previous_page(self) -> None:
+        """跳转到上一页，也就是更新的一页记录。"""
+        self._set_page(self.current_page_index - 1)
+
+    def go_next_page(self) -> None:
+        """跳转到下一页，也就是更旧的一页记录。"""
+        self._set_page(self.current_page_index + 1)
+
+    def go_last_page(self) -> None:
+        """跳转到最旧记录所在的最后一页。"""
+        self._set_page(_page_count(self.total_event_count, self._event_page_size()) - 1)
+
+    def _set_page(self, page_index: int) -> None:
+        """设置当前页并刷新表格，页码使用从 0 开始的内部索引。"""
+        max_page_index = max(0, _page_count(self.total_event_count, self._event_page_size()) - 1)
+        self.current_page_index = min(max(0, page_index), max_page_index)
+        self.last_selected_event_id = None
+        self.refresh_table()
+
+    def _event_page_size(self) -> int:
+        """读取配置中的分页大小，并兜底为 1000。"""
+        return max(1, int(getattr(self.http_server.config, "event_page_size", 1000) or 1000))
+
+    def _update_pagination_controls(self) -> None:
+        """根据当前页和总数更新翻页按钮状态与页码说明。"""
+        page_size = self._event_page_size()
+        page_count = _page_count(self.total_event_count, page_size)
+        current_page = min(self.current_page_index + 1, page_count)
+        has_previous = self.current_page_index > 0
+        has_next = self.current_page_index < page_count - 1
+
+        self.first_page_button.setEnabled(has_previous)
+        self.prev_page_button.setEnabled(has_previous)
+        self.next_page_button.setEnabled(has_next)
+        self.last_page_button.setEnabled(has_next)
+        self.page_info_label.setText(
+            f"第 {current_page} / {page_count} 页，共 {self.total_event_count} 条，每页 {page_size} 条"
+        )
+
     def refresh_table(self) -> None:
         """从数据库读取最新记录并刷新表格。"""
         selected_id = (
@@ -1356,7 +1428,13 @@ class MainWindow(QMainWindow):
             or self.detail_panel.current_event_id
         )
         previous_detail_id = self.detail_panel.current_event_id
-        rows = self.store.list_events()
+        page_size = self._event_page_size()
+        self.total_event_count = self.store.count_events()
+        max_page_index = max(0, _page_count(self.total_event_count, page_size) - 1)
+        if self.current_page_index > max_page_index:
+            self.current_page_index = max_page_index
+        offset = self.current_page_index * page_size
+        rows = self.store.list_events(limit=page_size, offset=offset)
         selected_after_refresh: int | None = None
         scroll_state = self._capture_table_scroll_state()
 
@@ -1403,6 +1481,7 @@ class MainWindow(QMainWindow):
         elif previous_detail_id != selected_after_refresh:
             self.last_selected_event_id = selected_after_refresh
             self.show_selected_detail()
+        self._update_pagination_controls()
 
     def show_selected_detail(self, _item: QTableWidgetItem | None = None) -> None:
         """左侧列表选择变化后，在右侧常驻面板显示完整详情。"""
@@ -1549,6 +1628,13 @@ def _table_item(
         item.setBackground(background)
     item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     return item
+
+
+def _page_count(total: int, page_size: int) -> int:
+    """按总记录数和每页大小计算页数，空表也显示 1 页。"""
+    safe_total = max(0, int(total))
+    safe_page_size = max(1, int(page_size))
+    return max(1, (safe_total + safe_page_size - 1) // safe_page_size)
 
 
 def run_gui(

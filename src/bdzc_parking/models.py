@@ -9,7 +9,7 @@ from typing import Any
 from bdzc_parking.config import AppConfig
 
 
-FORWARD_PASSING_TYPES = {"plateRecognition", "stop"}
+FORWARD_PASSING_TYPES = {"plateRecognition", "stop", "manual"}
 
 
 @dataclass(frozen=True)

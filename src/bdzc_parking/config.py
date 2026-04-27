@@ -40,6 +40,7 @@ CONFIG_VALUE_KEYS = {
     "artifact_retention_days",
     "image_rate_limit_per_minute",
     "image_rate_limit_burst",
+    "event_page_size",
     "db_path",
     "log_path",
     "event_table_column_widths",
@@ -77,6 +78,7 @@ class AppConfig:
     artifact_retention_days: int = 30
     image_rate_limit_per_minute: int = 60
     image_rate_limit_burst: int = 20
+    event_page_size: int = 1000
     db_path: Path = Path("data/bdzc_parking.sqlite3")
     log_path: Path = Path("logs/bdzc_parking.log")
     event_table_column_widths: list[int] = field(default_factory=list)
@@ -151,6 +153,7 @@ class AppConfig:
             "artifact_retention_days": self.artifact_retention_days,
             "image_rate_limit_per_minute": self.image_rate_limit_per_minute,
             "image_rate_limit_burst": self.image_rate_limit_burst,
+            "event_page_size": self.event_page_size,
             "db_path": _path_to_config_text(self.db_path),
             "log_path": _path_to_config_text(self.log_path),
             "event_table_column_widths": self.event_table_column_widths,
@@ -228,6 +231,8 @@ class AppConfig:
             raise ValueError("image_rate_limit_per_minute 必须大于 0")
         if self.image_rate_limit_burst <= 0:
             raise ValueError("image_rate_limit_burst 必须大于 0")
+        if self.event_page_size <= 0:
+            raise ValueError("event_page_size 必须大于 0")
         if self.external_url_base.strip():
             _validate_external_url_base(self.external_url_base)
 
@@ -277,6 +282,7 @@ def _coerce_value(key: str, value: Any) -> object:
         "artifact_retention_days",
         "image_rate_limit_per_minute",
         "image_rate_limit_burst",
+        "event_page_size",
     }:
         return int(value)
     if key in {

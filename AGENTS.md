@@ -25,7 +25,7 @@
 # 需求描述
 - HTTP server 接收海康威视停车终端发送来的 multipart/JSON 过车消息，监听地址、端口和路径由配置控制
 - 接收到消息后解析过车字段和图片，写入 SQLite 数据库，保留原始 HTTP body、原始 JSON、大园区请求 JSON、发送状态、发送次数、下次重试时间、返回信息和错误信息
-- 只自动发送符合条件的过车信息：停车场出入口事件、active 状态、方向为 enter/exit、passingType 为 plateRecognition / stop, 车牌有效，且过车时间相对接收时间没有超过配置的过旧跳过秒数
+- 只自动发送符合条件的过车信息：停车场出入口事件、active 状态、方向为 enter/exit、passingType 为 plateRecognition / stop / manual, 车牌有效，且过车时间相对接收时间没有超过配置的过旧跳过秒数
 - 对需要发送的记录转换为大园区停车系统 API payload，并按业务要求反转方向：我方进场转换为对方出场，我方出场转换为对方进场
 - 自动发送采用持久化状态机：`pending`、`sending`、`failed_retryable`、`dead_letter`、`sent`、`skipped`、`parse_error`
 - 发送失败后固定在 1、5、10 秒后重试；第 4 次实际发送仍失败时，记录错误并转为 `dead_letter`，不再自动补发

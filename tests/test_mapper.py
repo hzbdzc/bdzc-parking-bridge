@@ -73,6 +73,20 @@ def test_filter_accepts_stop_but_rejects_no_plate() -> None:
     assert should_forward(no_plate_event) == (False, "invalid plateNo")
 
 
+def test_filter_accepts_manual_passing_type() -> None:
+    """manual 手动放行记录也应进入自动发送流程。"""
+    manual_event = replace(_event("20260412_063354_226439_body.bin"), passing_type="manual")
+
+    assert should_forward(manual_event) == (True, "")
+
+
+def test_filter_rejects_manual_without_plate() -> None:
+    """manual 手动放行记录仍必须有有效车牌。"""
+    manual_no_plate_event = replace(_event("20260412_113252_857892_body.bin"), passing_type="manual")
+
+    assert should_forward(manual_no_plate_event) == (False, "invalid plateNo")
+
+
 def test_filter_rejects_stale_event_by_config() -> None:
     """过车时间相对接收时间超过配置秒数时不应自动发送。"""
     event = _event("20260412_063354_226439_body.bin")

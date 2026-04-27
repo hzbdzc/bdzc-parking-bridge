@@ -311,8 +311,10 @@ class EventStore:
                 ),
             )
 
-    def list_events(self, limit: int = 300) -> list[dict[str, Any]]:
-        """按记录 ID 倒序读取最近的事件列表。"""
+    def list_events(self, limit: int = 300, offset: int = 0) -> list[dict[str, Any]]:
+        """按记录 ID 倒序分页读取事件列表。"""
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
@@ -332,11 +334,17 @@ class EventStore:
                     dead_lettered_at, status_code, response_text, last_error
                 FROM events
                 ORDER BY id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (safe_limit, safe_offset),
             ).fetchall()
             return [self._with_image_file_size(dict(row)) for row in rows]
+
+    def count_events(self) -> int:
+        """返回事件总数，供 GUI 计算分页信息。"""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT count(*) AS total FROM events").fetchone()
+            return int(row["total"] if row is not None else 0)
 
     def get_event(self, event_id: int) -> dict[str, Any] | None:
         """按数据库 ID 读取单条事件记录。"""

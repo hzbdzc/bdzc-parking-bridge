@@ -26,6 +26,7 @@
   "artifact_retention_days": 30,
   "image_rate_limit_per_minute": 60,
   "image_rate_limit_burst": 20,
+  "event_page_size": 1000,
   "db_path": "data/bdzc_parking.sqlite3",
   "log_path": "logs/bdzc_parking.log",
   "event_table_column_widths": []

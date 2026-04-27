@@ -28,6 +28,7 @@ def test_load_creates_default_config_file(tmp_path: Path) -> None:
     assert data["max_event_age_seconds"] == 60.0
     assert data["external_url_base"] == ""
     assert data["image_rate_limit_per_minute"] == 60
+    assert data["event_page_size"] == 1000
     assert data["event_table_column_widths"] == []
     assert data["partner_api_url"] == config.partner_api_url
     assert data["local_exit_hobby"] == "in"
@@ -52,6 +53,7 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
                 "local_entry_cid": "ENTRY-001",
                 "max_event_age_seconds": "30.5",
                 "image_rate_limit_per_minute": "90",
+                "event_page_size": "1000",
                 "db_path": "custom.sqlite3",
                 "event_table_column_widths": ["80", 160, "bad", -10],
             }
@@ -71,6 +73,7 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
     assert config.local_entry_cid == "ENTRY-001"
     assert config.max_event_age_seconds == 30.5
     assert config.image_rate_limit_per_minute == 90
+    assert config.event_page_size == 1000
     assert config.db_path == Path("custom.sqlite3")
     assert config.event_table_column_widths == [80, 160]
 
@@ -115,6 +118,15 @@ def test_read_from_path_rejects_invalid_hobby(tmp_path: Path) -> None:
     config_path.write_text(json.dumps({"local_exit_hobby": "leave"}), encoding="utf-8")
 
     with pytest.raises(ValueError, match="local_exit_hobby"):
+        AppConfig.read_from_path(config_path)
+
+
+def test_read_from_path_rejects_invalid_event_page_size(tmp_path: Path) -> None:
+    """主列表分页大小必须大于 0。"""
+    config_path = tmp_path / "bad-page-size.json"
+    config_path.write_text(json.dumps({"event_page_size": 0}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="event_page_size"):
         AppConfig.read_from_path(config_path)
 
 

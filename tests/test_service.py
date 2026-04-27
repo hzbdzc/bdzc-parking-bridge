@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -121,6 +122,34 @@ def test_stop_record_is_auto_sent(tmp_path: Path) -> None:
         assert row["auto_send"] == 1
         assert row["skip_reason"] == ""
         assert row["passing_type"] == "stop"
+        assert client.payloads[0]["car"] == row["plate_no"]
+    finally:
+        service.close()
+
+
+def test_manual_record_is_auto_sent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """manual 手动放行记录也应进入自动发送流程。"""
+    original_extract_event = service_module.extract_event
+
+    def extract_manual_event(raw):
+        return replace(original_extract_event(raw), passing_type="manual")
+
+    monkeypatch.setattr(service_module, "extract_event", extract_manual_event)
+    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0)
+    store = EventStore(tmp_path / "events.sqlite3")
+    client = CapturingClient(config)
+    service = ParkingBridgeService(config, store, client)
+    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+
+    try:
+        service.handle_request(CONTENT_TYPE, body)
+        assert _wait_until(lambda: client.calls == 1)
+
+        row = store.list_events()[0]
+        assert row["status"] == "sent"
+        assert row["auto_send"] == 1
+        assert row["skip_reason"] == ""
+        assert row["passing_type"] == "manual"
         assert client.payloads[0]["car"] == row["plate_no"]
     finally:
         service.close()

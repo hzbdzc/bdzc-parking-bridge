@@ -82,6 +82,38 @@ def test_store_saves_event_image(tmp_path: Path) -> None:
     assert sent["status_code"] == 200
 
 
+def test_list_events_supports_pagination_and_total_count(tmp_path: Path) -> None:
+    """事件列表应能按 ID 倒序分页读取，并提供总数。"""
+    store = EventStore(tmp_path / "events.sqlite3")
+    with store._connect() as conn:
+        for index in range(1005):
+            conn.execute(
+                """
+                INSERT INTO events (event_key, received_at, updated_at, status, event_time, plate_no)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"page-event-{index}",
+                    "2026-04-27T14:00:00",
+                    "2026-04-27T14:00:00",
+                    "sent",
+                    "2026-04-27T14:00:00+08:00",
+                    f"浙A{index:05d}",
+                ),
+            )
+
+    first_page = store.list_events(limit=1000, offset=0)
+    second_page = store.list_events(limit=1000, offset=1000)
+
+    assert store.count_events() == 1005
+    assert len(first_page) == 1000
+    assert len(second_page) == 5
+    assert first_page[0]["id"] == 1005
+    assert first_page[-1]["id"] == 6
+    assert second_page[0]["id"] == 5
+    assert second_page[-1]["id"] == 1
+
+
 def test_reopen_store_migrates_legacy_failed_to_dead_letter(tmp_path: Path) -> None:
     """旧版本遗留的 failed 状态应在重新打开数据库时升级为 dead_letter。"""
     body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()

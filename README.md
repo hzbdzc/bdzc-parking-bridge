@@ -6,7 +6,7 @@
 
 - 内置 HTTP server，接收海康停车终端上报的过车消息。
 - 解析海康 multipart/JSON 报文，提取过车字段和图片。
-- 按规则过滤自动发送事件，支持车牌识别和停车触发两类有效事件，跳过无车牌、无效事件类型、过车时间过旧等不需要自动发送的记录。
+- 按规则过滤自动发送事件，支持车牌识别、停车触发和手动放行三类有效事件，跳过无车牌、无效事件类型、过车时间过旧等不需要自动发送的记录。
 - 对于车牌有效且方向可映射的记录，预生成大园区 API payload；即使默认跳过自动发送，仍可在详情里手动发送。
 - 自动发送采用持久化状态机 `pending / sending / failed_retryable / dead_letter / sent / skipped / parse_error`。
 - 自动发送失败后固定在 `1s / 5s / 10s` 后重试；第 4 次实际发送仍失败时转为 `dead_letter`，不再自动补发。
@@ -15,7 +15,7 @@
 - 发送链路使用固定后台 worker 和有界队列，避免下游 API 异常时线程数无限增长。
 - 提供最小运维接口：`GET /healthz` 返回进程和 SQLite 健康状态，`GET /status` 返回失败堆积、队列长度、最近成功发送时间和数据库大小。
 - SQLite 启用 WAL / busy timeout，并按保留期清理过期事件、图片和原始报文。
-- 使用 Qt GUI 控制 HTTP server、查看过车列表和详情、载入/导出配置、查看日志、执行模拟发送测试。
+- 使用 Qt GUI 控制 HTTP server、分页查看过车列表和详情、载入/导出配置、查看日志、执行模拟发送测试。
 
 ## 运行方法
 
@@ -69,7 +69,7 @@ GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会
 - `sender_worker_count`、`sender_queue_size`、`stale_sending_seconds`
 - `event_retention_days`、`artifact_retention_days`
 - `image_rate_limit_per_minute`、`image_rate_limit_burst`
-- `db_path`、`log_path`、`event_table_column_widths`
+- `db_path`、`log_path`、`event_page_size`、`event_table_column_widths`
 
 其中：
 
@@ -77,6 +77,7 @@ GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会
 - `external_url_base` 必须带明确 path 前缀，程序会把这个 path 前缀作为图片下载路由，例如 `https://host/parking-images` 对应 `/parking-images/<文件名>`。
 - 自动发送重试策略固定为 `1s / 5s / 10s`，不再由配置文件控制。
 - `image_rate_limit_per_minute` 和 `image_rate_limit_burst` 只作用于图片 GET，不影响海康 `POST/PUT` 上报。
+- `event_page_size` 控制 GUI 主列表每页记录数，默认 `1000`；可通过首页、上一页、下一页、末页查看旧记录。
 
 GUI 配置窗口支持直接编辑当前活动配置、载入外部配置文件并立即应用、把当前配置导出到指定文件。鼠标悬浮每个配置项时会显示用途和生效说明。
 
