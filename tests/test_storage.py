@@ -114,6 +114,69 @@ def test_list_events_supports_pagination_and_total_count(tmp_path: Path) -> None
     assert second_page[-1]["id"] == 1
 
 
+def test_list_events_supports_gui_filters(tmp_path: Path) -> None:
+    """GUI 列表筛选应支持车牌包含匹配、下拉精确匹配和返回信息匹配。"""
+    store = EventStore(tmp_path / "events.sqlite3")
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO events (
+                event_key, received_at, updated_at, status, event_time, direction,
+                passing_type, plate_no, lane_name, status_code, response_text
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "filter-1",
+                "2026-04-27T14:00:00",
+                "2026-04-27T14:00:00",
+                "sent",
+                "2026-04-27T14:00:00+08:00",
+                "enter",
+                "plateRecognition",
+                "浙A12345",
+                "入口一",
+                200,
+                '{"status":200,"msg":"ok"}',
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO events (
+                event_key, received_at, updated_at, status, event_time, direction,
+                passing_type, plate_no, lane_name, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "filter-2",
+                "2026-04-28T15:00:00",
+                "2026-04-28T15:00:00",
+                "dead_letter",
+                "2026-04-28T15:00:00+08:00",
+                "exit",
+                "manual",
+                "川Q21C65",
+                "出口一",
+                "timeout",
+            ),
+        )
+
+    plate_rows = store.list_events(filters={"plate_no": "A123"})
+    date_rows = store.list_events(filters={"event_date": "2026-04-27"})
+    direction_rows = store.list_events(filters={"direction": "exit"})
+    return_rows = store.list_events(filters={"return_info": "last_error:timeout"})
+
+    assert store.count_events({"plate_no": "A123"}) == 1
+    assert plate_rows[0]["plate_no"] == "浙A12345"
+    assert [row["plate_no"] for row in date_rows] == ["浙A12345"]
+    assert direction_rows[0]["plate_no"] == "川Q21C65"
+    assert return_rows[0]["status"] == "dead_letter"
+    assert store.list_event_filter_values("event_date") == ["2026-04-28", "2026-04-27"]
+    assert "exit" in store.list_event_filter_values("direction", {"plate_no": "Q21"})
+    assert "status_code:200" in store.list_event_filter_values("return_info")
+
+
 def test_reopen_store_migrates_legacy_failed_to_dead_letter(tmp_path: Path) -> None:
     """旧版本遗留的 failed 状态应在重新打开数据库时升级为 dead_letter。"""
     body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()

@@ -19,6 +19,14 @@ from bdzc_parking.models import HikEvent, SendResult
 
 LOGGER = logging.getLogger(__name__)
 SQLITE_BUSY_TIMEOUT_MS = 5000
+EVENT_FILTER_VALUE_LIMIT = 500
+EVENT_FILTER_COLUMNS = {
+    "direction": "direction",
+    "lane_name": "lane_name",
+    "passing_type": "passing_type",
+    "status": "status",
+}
+EVENT_DATE_EXPRESSION = "substr(COALESCE(NULLIF(event_time, ''), received_at), 1, 10)"
 _FILENAME_TOKEN_MAP = {
     "京": "JING",
     "津": "JIN",
@@ -311,13 +319,19 @@ class EventStore:
                 ),
             )
 
-    def list_events(self, limit: int = 300, offset: int = 0) -> list[dict[str, Any]]:
-        """按记录 ID 倒序分页读取事件列表。"""
+    def list_events(
+        self,
+        limit: int = 300,
+        offset: int = 0,
+        filters: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按记录 ID 倒序分页读取事件列表，并按 GUI 筛选条件限制结果。"""
         safe_limit = max(1, int(limit))
         safe_offset = max(0, int(offset))
+        where_sql, params = _event_filter_where_clause(filters)
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     id, event_key, received_at, updated_at, status, auto_send,
                     skip_reason, event_time, direction, passing_type, plate_no,
@@ -333,18 +347,67 @@ class EventStore:
                     attempts, first_attempt_at, last_attempt_at, next_retry_at,
                     dead_lettered_at, status_code, response_text, last_error
                 FROM events
+                {where_sql}
                 ORDER BY id DESC
                 LIMIT ? OFFSET ?
                 """,
-                (safe_limit, safe_offset),
+                (*params, safe_limit, safe_offset),
             ).fetchall()
             return [self._with_image_file_size(dict(row)) for row in rows]
 
-    def count_events(self) -> int:
-        """返回事件总数，供 GUI 计算分页信息。"""
+    def count_events(self, filters: dict[str, object] | None = None) -> int:
+        """返回事件总数，供 GUI 按筛选条件计算分页信息。"""
+        where_sql, params = _event_filter_where_clause(filters)
         with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT count(*) AS total FROM events").fetchone()
+            row = conn.execute(
+                f"SELECT count(*) AS total FROM events {where_sql}",
+                params,
+            ).fetchone()
             return int(row["total"] if row is not None else 0)
+
+    def list_event_filter_values(
+        self,
+        filter_key: str,
+        filters: dict[str, object] | None = None,
+        limit: int = EVENT_FILTER_VALUE_LIMIT,
+    ) -> list[str]:
+        """读取指定列表列的下拉筛选候选值，忽略该列自身当前筛选。"""
+        safe_limit = max(1, int(limit))
+        where_sql, params = _event_filter_where_clause(filters, exclude_key=filter_key)
+        with self._lock, self._connect() as conn:
+            if filter_key == "event_date":
+                value_where_sql = _append_where_condition(where_sql, f"{EVENT_DATE_EXPRESSION} != ''")
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT {EVENT_DATE_EXPRESSION} AS value
+                    FROM events
+                    {value_where_sql}
+                    ORDER BY value DESC
+                    LIMIT ?
+                    """,
+                    (*params, safe_limit),
+                ).fetchall()
+                return [str(row["value"]) for row in rows]
+
+            if filter_key == "return_info":
+                return _list_return_info_filter_values(conn, where_sql, params, safe_limit)
+
+            column = EVENT_FILTER_COLUMNS.get(filter_key)
+            if column is None:
+                return []
+
+            value_where_sql = _append_where_condition(where_sql, f"{column} != ''")
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT {column} AS value
+                FROM events
+                {value_where_sql}
+                ORDER BY {column} COLLATE NOCASE ASC
+                LIMIT ?
+                """,
+                (*params, safe_limit),
+            ).fetchall()
+            return [str(row["value"]) for row in rows]
 
     def get_event(self, event_id: int) -> dict[str, Any] | None:
         """按数据库 ID 读取单条事件记录。"""
@@ -990,6 +1053,147 @@ def _time_seconds_ago(seconds: float) -> str:
 def _time_days_ago(days: int) -> str:
     """返回若干天前的本地时间字符串。"""
     return (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def _event_filter_where_clause(
+    filters: dict[str, object] | None,
+    exclude_key: str | None = None,
+) -> tuple[str, tuple[object, ...]]:
+    """把 GUI 列表筛选状态转换成 SQLite WHERE 子句和参数。"""
+    clauses: list[str] = []
+    params: list[object] = []
+    for key, raw_value in (filters or {}).items():
+        if key == exclude_key:
+            continue
+        value = str(raw_value or "").strip()
+        if not value:
+            continue
+
+        if key == "event_date":
+            clauses.append(f"{EVENT_DATE_EXPRESSION} = ?")
+            params.append(value)
+            continue
+
+        if key == "plate_no":
+            clauses.append("plate_no LIKE ? ESCAPE '\\' COLLATE NOCASE")
+            params.append(f"%{_escape_like(value)}%")
+            continue
+
+        if key == "return_info":
+            return_clause, return_params = _return_info_filter_clause(value)
+            if return_clause:
+                clauses.append(return_clause)
+                params.extend(return_params)
+            continue
+
+        column = EVENT_FILTER_COLUMNS.get(key)
+        if column is not None:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return where_sql, tuple(params)
+
+
+def _append_where_condition(where_sql: str, condition: str) -> str:
+    """给可能为空的 WHERE 子句追加一个额外条件。"""
+    if where_sql:
+        return f"{where_sql} AND {condition}"
+    return f"WHERE {condition}"
+
+
+def _escape_like(value: str) -> str:
+    """转义用户输入中的 LIKE 通配符，保证车牌筛选按字面量匹配。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _return_info_filter_clause(value: str) -> tuple[str, tuple[object, ...]]:
+    """把返回信息下拉值转换成可执行的 SQL 条件。"""
+    if value == "empty:":
+        return "(status_code IS NULL AND response_text = '' AND last_error = '')", ()
+    if value.startswith("status_code:"):
+        return "status_code = ?", (value.removeprefix("status_code:"),)
+    if value.startswith("response_text:"):
+        return "response_text = ?", (value.removeprefix("response_text:"),)
+    if value.startswith("last_error:"):
+        return "last_error = ?", (value.removeprefix("last_error:"),)
+
+    like_value = f"%{_escape_like(value)}%"
+    return (
+        "(CAST(status_code AS TEXT) LIKE ? ESCAPE '\\' "
+        "OR response_text LIKE ? ESCAPE '\\' COLLATE NOCASE "
+        "OR last_error LIKE ? ESCAPE '\\' COLLATE NOCASE)",
+        (like_value, like_value, like_value),
+    )
+
+
+def _list_return_info_filter_values(
+    conn: sqlite3.Connection,
+    where_sql: str,
+    params: tuple[object, ...],
+    limit: int,
+) -> list[str]:
+    """读取返回信息列的候选筛选值，包括 HTTP 状态、返回原文和错误原文。"""
+    values: list[str] = []
+    empty_where_sql = _append_where_condition(
+        where_sql,
+        "status_code IS NULL AND response_text = '' AND last_error = ''",
+    )
+    empty_row = conn.execute(
+        f"SELECT 1 FROM events {empty_where_sql} LIMIT 1",
+        params,
+    ).fetchone()
+    if empty_row is not None:
+        values.append("empty:")
+
+    status_where_sql = _append_where_condition(where_sql, "status_code IS NOT NULL")
+    status_rows = conn.execute(
+        f"""
+        SELECT DISTINCT status_code AS value
+        FROM events
+        {status_where_sql}
+        ORDER BY status_code ASC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    values.extend(f"status_code:{row['value']}" for row in status_rows)
+
+    remaining = max(0, limit - len(values))
+    if remaining > 0:
+        values.extend(
+            _distinct_text_filter_values(conn, where_sql, params, "response_text", "response_text:", remaining)
+        )
+
+    remaining = max(0, limit - len(values))
+    if remaining > 0:
+        values.extend(
+            _distinct_text_filter_values(conn, where_sql, params, "last_error", "last_error:", remaining)
+        )
+    return values[:limit]
+
+
+def _distinct_text_filter_values(
+    conn: sqlite3.Connection,
+    where_sql: str,
+    params: tuple[object, ...],
+    column: str,
+    prefix: str,
+    limit: int,
+) -> list[str]:
+    """读取指定文本列的非空去重值，并带上筛选类型前缀。"""
+    text_where_sql = _append_where_condition(where_sql, f"{column} != ''")
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT {column} AS value
+        FROM events
+        {text_where_sql}
+        ORDER BY {column} COLLATE NOCASE ASC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [f"{prefix}{row['value']}" for row in rows]
 
 
 def _payload_with_image_reference(

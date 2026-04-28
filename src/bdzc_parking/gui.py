@@ -164,6 +164,19 @@ STATUS_LABELS = {
     "skipped": "已跳过",
     "parse_error": "解析失败",
 }
+EVENT_TABLE_HEADERS = ["ID", "过车时间", "车牌", "方向", "通道", "类型", "状态/次数/原因", "返回信息"]
+EVENT_TABLE_FILTER_KEYS = [
+    "",
+    "event_date",
+    "plate_no",
+    "direction",
+    "lane_name",
+    "passing_type",
+    "status",
+    "return_info",
+]
+FILTER_ALL_TEXT = "全部"
+FILTER_OPTION_LIMIT = 500
 
 
 class BridgeSignals(QObject):
@@ -1089,11 +1102,18 @@ class MainWindow(QMainWindow):
         self.total_event_count = 0
         self.sort_column = 0
         self.sort_order = Qt.SortOrder.DescendingOrder
+        self.event_filters: dict[str, str] = {}
+        self.filter_controls: dict[str, QWidget] = {}
+        self._updating_filter_controls = False
         self.signals = BridgeSignals()
         self.column_width_save_timer = QTimer(self)
         self.column_width_save_timer.setSingleShot(True)
         self.column_width_save_timer.setInterval(500)
         self.column_width_save_timer.timeout.connect(self._save_table_column_widths)
+        self.plate_filter_timer = QTimer(self)
+        self.plate_filter_timer.setSingleShot(True)
+        self.plate_filter_timer.setInterval(300)
+        self.plate_filter_timer.timeout.connect(self._apply_filter_controls)
         # 后台线程不直接操作 Qt 控件，而是通过 signal 切回主线程刷新。
         self.signals.changed.connect(lambda _event_id: self.refresh_table())
         self._attach_service_listener()
@@ -1265,10 +1285,8 @@ class MainWindow(QMainWindow):
         page_bar.addWidget(self.page_info_label)
         page_bar.addStretch(1)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(
-            ["ID", "过车时间", "车牌", "方向", "通道", "类型", "状态/次数/原因", "返回信息"]
-        )
+        self.table = QTableWidget(0, len(EVENT_TABLE_HEADERS))
+        self.table.setHorizontalHeaderLabels(EVENT_TABLE_HEADERS)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
@@ -1283,16 +1301,26 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self.show_selected_detail)
         self._restore_table_column_widths()
-        header.sectionResized.connect(
-            lambda _logical_index, _old_size, _new_size: self._schedule_save_table_column_widths()
+        header.sectionResized.connect(self._handle_table_column_resized)
+        self.filter_scroll = self._build_filter_row()
+        self.table.horizontalScrollBar().valueChanged.connect(
+            self.filter_scroll.horizontalScrollBar().setValue
         )
         self.detail_panel = EventDetailPanel(
             lambda: self.service.config,
             self.manual_resend_selected,
         )
 
+        table_panel = QWidget()
+        table_layout = QVBoxLayout()
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(2)
+        table_layout.addWidget(self.filter_scroll)
+        table_layout.addWidget(self.table, 1)
+        table_panel.setLayout(table_layout)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.table)
+        splitter.addWidget(table_panel)
         splitter.addWidget(self.detail_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
@@ -1306,7 +1334,110 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+        self._refresh_filter_options()
+        self._sync_filter_widths()
         self._update_buttons()
+
+    def _build_filter_row(self) -> QScrollArea:
+        """创建与列表列宽同步的表头筛选控件行。"""
+        self.filter_content = QWidget()
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(0)
+        for key, header_text in zip(EVENT_TABLE_FILTER_KEYS, EVENT_TABLE_HEADERS, strict=True):
+            control = self._create_filter_control(key, header_text)
+            self.filter_controls[key] = control
+            filter_layout.addWidget(control)
+        self.filter_content.setLayout(filter_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self.filter_content)
+        scroll.setWidgetResizable(False)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(32)
+        return scroll
+
+    def _create_filter_control(self, key: str, header_text: str) -> QWidget:
+        """按列类型创建车牌输入框或下拉筛选框。"""
+        if not key:
+            placeholder = QLabel("")
+            placeholder.setToolTip("ID 不筛选")
+            return placeholder
+
+        if key == "plate_no":
+            edit = QLineEdit()
+            edit.setPlaceholderText("输入车牌")
+            edit.setToolTip("车牌支持输入部分字符串筛选")
+            edit.textChanged.connect(lambda _text: self.plate_filter_timer.start())
+            return edit
+
+        combo = QComboBox()
+        combo.setToolTip(f"{header_text}筛选")
+        combo.currentIndexChanged.connect(lambda _index: self._apply_filter_controls())
+        return combo
+
+    def _sync_filter_widths(self) -> None:
+        """把筛选控件宽度同步到表格列宽，保持视觉上贴近表头。"""
+        total_width = 0
+        for column_index, key in enumerate(EVENT_TABLE_FILTER_KEYS):
+            width = self.table.columnWidth(column_index)
+            control = self.filter_controls.get(key)
+            if control is not None:
+                control.setFixedWidth(width)
+            total_width += width
+        self.filter_content.setFixedWidth(total_width)
+
+    def _refresh_filter_options(self) -> None:
+        """刷新下拉筛选候选值，并保留用户当前选择。"""
+        self._updating_filter_controls = True
+        try:
+            for key, control in self.filter_controls.items():
+                if not isinstance(control, QComboBox):
+                    continue
+
+                current_value = self.event_filters.get(key, "")
+                values = self.store.list_event_filter_values(key, self.event_filters, FILTER_OPTION_LIMIT)
+                if current_value and current_value not in values:
+                    values.insert(0, current_value)
+
+                was_blocked = control.blockSignals(True)
+                try:
+                    control.clear()
+                    control.addItem(FILTER_ALL_TEXT, "")
+                    for value in values:
+                        control.addItem(_filter_option_label(key, value), value)
+                    index = control.findData(current_value)
+                    control.setCurrentIndex(index if index >= 0 else 0)
+                finally:
+                    control.blockSignals(was_blocked)
+        finally:
+            self._updating_filter_controls = False
+
+    def _apply_filter_controls(self) -> None:
+        """读取筛选控件状态，重置到第一页并刷新列表。"""
+        if self._updating_filter_controls:
+            return
+
+        filters: dict[str, str] = {}
+        for key, control in self.filter_controls.items():
+            if not key:
+                continue
+            if isinstance(control, QLineEdit):
+                value = control.text().strip()
+            elif isinstance(control, QComboBox):
+                value = str(control.currentData() or "").strip()
+            else:
+                continue
+            if value:
+                filters[key] = value
+
+        if filters == self.event_filters:
+            return
+        self.event_filters = filters
+        self.current_page_index = 0
+        self.last_selected_event_id = None
+        self.refresh_table()
 
     def open_config_dialog(self) -> None:
         """点击配置按钮后打开配置编辑弹窗。"""
@@ -1458,12 +1589,13 @@ class MainWindow(QMainWindow):
         )
         previous_detail_id = self.detail_panel.current_event_id
         page_size = self._event_page_size()
-        self.total_event_count = self.store.count_events()
+        self.total_event_count = self.store.count_events(self.event_filters)
         max_page_index = max(0, _page_count(self.total_event_count, page_size) - 1)
         if self.current_page_index > max_page_index:
             self.current_page_index = max_page_index
         offset = self.current_page_index * page_size
-        rows = self.store.list_events(limit=page_size, offset=offset)
+        rows = self.store.list_events(limit=page_size, offset=offset, filters=self.event_filters)
+        self._refresh_filter_options()
         selected_after_refresh: int | None = None
         scroll_state = self._capture_table_scroll_state()
 
@@ -1620,6 +1752,11 @@ class MainWindow(QMainWindow):
         self.sort_column = column
         self.sort_order = order
 
+    def _handle_table_column_resized(self, _logical_index: int, _old_size: int, _new_size: int) -> None:
+        """表格列宽变化时同步筛选控件宽度并延迟保存配置。"""
+        self._sync_filter_widths()
+        self._schedule_save_table_column_widths()
+
     def _schedule_save_table_column_widths(self) -> None:
         """用户拖动列宽后延迟保存，避免拖动过程中频繁写配置文件。"""
         self.column_width_save_timer.start()
@@ -1775,6 +1912,45 @@ def _status_attempts(row: dict[str, object]) -> str:
 
     attempts = int(row.get("attempts") or 0)
     return f"{_status_label(row.get('status'))} / {attempts}次"
+
+
+def _filter_option_label(key: str, value: object) -> str:
+    """把数据库筛选值转换为下拉框中适合阅读的文本。"""
+    text = str(value or "")
+    if key == "event_date":
+        return text
+    if key == "direction":
+        return _direction_label(text)
+    if key == "passing_type":
+        return _passing_type_label(text)
+    if key == "status":
+        return _status_label(text)
+    if key == "return_info":
+        return _return_info_filter_label(text)
+    return text
+
+
+def _return_info_filter_label(value: str) -> str:
+    """把返回信息筛选内部值转换为简短下拉显示文本。"""
+    if value == "empty:":
+        return "空"
+    if value.startswith("status_code:"):
+        return f"HTTP {value.removeprefix('status_code:')}"
+    if value.startswith("response_text:"):
+        payload_text = value.removeprefix("response_text:")
+        label = _api_return_info({"response_text": payload_text}) or payload_text
+        return _ellipsize(label, 80)
+    if value.startswith("last_error:"):
+        return _ellipsize(f"错误：{value.removeprefix('last_error:')}", 80)
+    return _ellipsize(value, 80)
+
+
+def _ellipsize(value: str, limit: int) -> str:
+    """把过长的筛选项文本截短，避免下拉框被撑得过宽。"""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
 
 
 def _table_row_background(row: dict[str, object]) -> QColor | None:
