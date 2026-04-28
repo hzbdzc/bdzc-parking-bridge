@@ -33,6 +33,10 @@ CONFIG_VALUE_KEYS = {
     "max_event_age_seconds",
     "max_request_bytes",
     "request_read_timeout_seconds",
+    "http_watchdog_interval_seconds",
+    "http_watchdog_timeout_seconds",
+    "http_watchdog_failure_threshold",
+    "http_watchdog_restart_cooldown_seconds",
     "sender_worker_count",
     "sender_queue_size",
     "stale_sending_seconds",
@@ -71,6 +75,10 @@ class AppConfig:
     max_event_age_seconds: float = 60.0
     max_request_bytes: int = 1_048_576
     request_read_timeout_seconds: float = 15.0
+    http_watchdog_interval_seconds: float = 10.0
+    http_watchdog_timeout_seconds: float = 3.0
+    http_watchdog_failure_threshold: int = 2
+    http_watchdog_restart_cooldown_seconds: float = 30.0
     sender_worker_count: int = 4
     sender_queue_size: int = 1000
     stale_sending_seconds: float = 300.0
@@ -146,6 +154,10 @@ class AppConfig:
             "max_event_age_seconds": self.max_event_age_seconds,
             "max_request_bytes": self.max_request_bytes,
             "request_read_timeout_seconds": self.request_read_timeout_seconds,
+            "http_watchdog_interval_seconds": self.http_watchdog_interval_seconds,
+            "http_watchdog_timeout_seconds": self.http_watchdog_timeout_seconds,
+            "http_watchdog_failure_threshold": self.http_watchdog_failure_threshold,
+            "http_watchdog_restart_cooldown_seconds": self.http_watchdog_restart_cooldown_seconds,
             "sender_worker_count": self.sender_worker_count,
             "sender_queue_size": self.sender_queue_size,
             "stale_sending_seconds": self.stale_sending_seconds,
@@ -217,6 +229,14 @@ class AppConfig:
             raise ValueError("max_request_bytes 必须大于 0")
         if self.request_read_timeout_seconds <= 0:
             raise ValueError("request_read_timeout_seconds 必须大于 0")
+        if self.http_watchdog_interval_seconds <= 0:
+            raise ValueError("http_watchdog_interval_seconds 必须大于 0")
+        if self.http_watchdog_timeout_seconds <= 0:
+            raise ValueError("http_watchdog_timeout_seconds 必须大于 0")
+        if self.http_watchdog_failure_threshold <= 0:
+            raise ValueError("http_watchdog_failure_threshold 必须大于 0")
+        if self.http_watchdog_restart_cooldown_seconds <= 0:
+            raise ValueError("http_watchdog_restart_cooldown_seconds 必须大于 0")
         if self.sender_worker_count <= 0:
             raise ValueError("sender_worker_count 必须大于 0")
         if self.sender_queue_size <= 0:
@@ -275,6 +295,7 @@ def _coerce_value(key: str, value: Any) -> object:
     if key in {
         "listen_port",
         "retry_count",
+        "http_watchdog_failure_threshold",
         "max_request_bytes",
         "sender_worker_count",
         "sender_queue_size",
@@ -290,6 +311,9 @@ def _coerce_value(key: str, value: Any) -> object:
         "request_timeout_seconds",
         "max_event_age_seconds",
         "request_read_timeout_seconds",
+        "http_watchdog_interval_seconds",
+        "http_watchdog_timeout_seconds",
+        "http_watchdog_restart_cooldown_seconds",
         "stale_sending_seconds",
     }:
         return float(value)

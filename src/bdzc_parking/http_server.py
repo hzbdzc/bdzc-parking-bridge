@@ -9,9 +9,11 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.error
+import urllib.request
 from urllib.parse import unquote, urlsplit
 
 from bdzc_parking.config import AppConfig
@@ -31,46 +33,242 @@ class BridgeHTTPServer:
         self.service = service
         self._server: _ServiceHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+        self._watchdog_stop_event = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_failure_count = 0
+        self._watchdog_restart_count = 0
+        self._watchdog_last_probe_at = ""
+        self._watchdog_last_probe_error = ""
+        self._watchdog_last_restart_at = ""
+        self._watchdog_next_restart_allowed_at = ""
+        self._watchdog_next_restart_allowed_monotonic = 0.0
 
     @property
     def is_running(self) -> bool:
         """返回 HTTP server 是否已经启动。"""
-        return self._server is not None
+        with self._lock:
+            self._cleanup_stopped_server_locked()
+            return self._server is not None and self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         """启动后台 HTTP server 线程。"""
-        if self._server is not None:
-            return
-        self._server = _ServiceHTTPServer(
+        with self._lock:
+            self._cleanup_stopped_server_locked()
+            if self._server is None:
+                self._start_server_locked()
+            self._start_watchdog_locked()
+
+    def stop(self) -> None:
+        """停止 HTTP server 并等待后台线程退出。"""
+        self._stop_watchdog()
+        self._stop_current_server()
+
+    def get_watchdog_snapshot(self) -> dict[str, object]:
+        """返回 HTTP server watchdog 的当前状态，供 /status 展示。"""
+        with self._lock:
+            next_restart_allowed_at = self._watchdog_next_restart_allowed_at
+            if self._watchdog_next_restart_allowed_monotonic <= time.monotonic():
+                next_restart_allowed_at = ""
+            return {
+                "enabled": self._watchdog_thread is not None and self._watchdog_thread.is_alive(),
+                "failure_count": self._watchdog_failure_count,
+                "restart_count": self._watchdog_restart_count,
+                "last_probe_at": self._watchdog_last_probe_at,
+                "last_probe_error": self._watchdog_last_probe_error,
+                "last_restart_at": self._watchdog_last_restart_at,
+                "next_restart_allowed_at": next_restart_allowed_at,
+            }
+
+    def _start_server_locked(self) -> None:
+        """在已持有锁时创建 HTTP server 并启动接收线程。"""
+        server = _ServiceHTTPServer(
             (self.config.listen_host, self.config.listen_port),
             HikRequestHandler,
             self.config,
             self.service,
+            self,
         )
-        self._thread = threading.Thread(
-            target=self._server.serve_forever,
+        thread = threading.Thread(
+            target=server.serve_forever,
             name="hikvision-http-server",
             daemon=True,
         )
-        self._thread.start()
+        self._server = server
+        self._thread = thread
+        try:
+            thread.start()
+        except Exception:
+            self._server = None
+            self._thread = None
+            server.server_close()
+            raise
+
         LOGGER.info(
             "HTTP server listening on %s:%s",
             self.config.listen_host,
-            self._server.server_port,
+            server.server_port,
         )
 
-    def stop(self) -> None:
-        """停止 HTTP server 并等待后台线程退出。"""
-        if self._server is None:
+    def _stop_current_server(self) -> None:
+        """停止当前 HTTP server 实例，但不处理 watchdog 生命周期。"""
+        with self._lock:
+            server = self._server
+            thread = self._thread
+            self._server = None
+            self._thread = None
+
+        if server is None:
             return
-        server = self._server
-        self._server = None
-        server.shutdown()
+
+        shutdown_thread = threading.Thread(
+            target=server.shutdown,
+            name="hikvision-http-server-shutdown",
+            daemon=True,
+        )
+        shutdown_thread.start()
+        shutdown_thread.join(timeout=5)
+        if shutdown_thread.is_alive():
+            LOGGER.warning("HTTP server shutdown timed out; closing listening socket")
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                LOGGER.warning("HTTP server thread did not exit within timeout")
+
         server.server_close()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-        self._thread = None
         LOGGER.info("HTTP server stopped")
+
+    def _cleanup_stopped_server_locked(self) -> None:
+        """清理已经退出但还残留在对象里的 HTTP server。"""
+        if self._server is None:
+            self._thread = None
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+
+        LOGGER.warning("HTTP server thread is not alive; cleaning up stale server state")
+        self._server.server_close()
+        self._server = None
+        self._thread = None
+
+    def _start_watchdog_locked(self) -> None:
+        """在已持有锁时启动 HTTP server 健康守护线程。"""
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_stop_event.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="hikvision-http-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        """停止 HTTP server 健康守护线程。"""
+        with self._lock:
+            thread = self._watchdog_thread
+            self._watchdog_stop_event.set()
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                LOGGER.warning("HTTP server watchdog thread did not exit within timeout")
+
+        with self._lock:
+            if self._watchdog_thread is thread:
+                self._watchdog_thread = None
+
+    def _watchdog_loop(self) -> None:
+        """周期性从本机探测 HTTP server，连续失败后自动重启。"""
+        while not self._watchdog_stop_event.wait(self.config.http_watchdog_interval_seconds):
+            if self._is_server_thread_dead():
+                reason = "HTTP server thread is not alive"
+                self._record_watchdog_failure(reason)
+                self._restart_from_watchdog(reason)
+                continue
+
+            ok, error = self._probe_http_root()
+            if ok:
+                self._record_watchdog_success()
+                continue
+
+            failure_count = self._record_watchdog_failure(error)
+            if failure_count >= self.config.http_watchdog_failure_threshold:
+                self._restart_from_watchdog(error)
+
+    def _is_server_thread_dead(self) -> bool:
+        """判断 server 对象仍存在但接收线程已经退出。"""
+        with self._lock:
+            if self._server is None:
+                return False
+            return self._thread is None or not self._thread.is_alive()
+
+    def _probe_http_root(self) -> tuple[bool, str]:
+        """通过 GET / 从外部视角确认 HTTP server 是否可响应。"""
+        with self._lock:
+            server = self._server
+            if server is None:
+                return False, "HTTP server is not running"
+            host = _watchdog_probe_host(self.config.listen_host)
+            port = server.server_port
+
+        url = f"http://{host}:{port}/"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with opener.open(request, timeout=self.config.http_watchdog_timeout_seconds) as response:
+                response.read(1)
+            return True, ""
+        except urllib.error.HTTPError:
+            return True, ""
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+
+    def _record_watchdog_success(self) -> None:
+        """记录一次成功探测，并清空连续失败计数。"""
+        with self._lock:
+            self._watchdog_last_probe_at = datetime.now().isoformat(timespec="seconds")
+            self._watchdog_last_probe_error = ""
+            self._watchdog_failure_count = 0
+
+    def _record_watchdog_failure(self, error: str) -> int:
+        """记录一次失败探测，并返回最新连续失败次数。"""
+        with self._lock:
+            self._watchdog_last_probe_at = datetime.now().isoformat(timespec="seconds")
+            self._watchdog_last_probe_error = error
+            self._watchdog_failure_count += 1
+            return self._watchdog_failure_count
+
+    def _restart_from_watchdog(self, reason: str) -> None:
+        """由 watchdog 触发 HTTP server 重启，并按 cooldown 限制频率。"""
+        now = time.monotonic()
+        with self._lock:
+            if now < self._watchdog_next_restart_allowed_monotonic:
+                return
+            cooldown_until = datetime.now() + timedelta(
+                seconds=self.config.http_watchdog_restart_cooldown_seconds
+            )
+            self._watchdog_next_restart_allowed_monotonic = (
+                now + self.config.http_watchdog_restart_cooldown_seconds
+            )
+            self._watchdog_next_restart_allowed_at = cooldown_until.isoformat(timespec="seconds")
+
+        LOGGER.warning("HTTP server watchdog restarting server: %s", reason)
+        self._stop_current_server()
+        try:
+            with self._lock:
+                self._start_server_locked()
+                self._watchdog_failure_count = 0
+                self._watchdog_last_probe_error = ""
+                self._watchdog_restart_count += 1
+                self._watchdog_last_restart_at = datetime.now().isoformat(timespec="seconds")
+        except Exception as exc:
+            with self._lock:
+                self._watchdog_last_probe_error = f"restart failed: {type(exc).__name__}: {exc}"
+            LOGGER.exception("HTTP server watchdog restart failed")
+        else:
+            LOGGER.info("HTTP server watchdog restarted server")
 
 
 class _ServiceHTTPServer(ThreadingHTTPServer):
@@ -85,11 +283,13 @@ class _ServiceHTTPServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         config: AppConfig,
         service: ParkingBridgeService,
+        bridge_server: BridgeHTTPServer,
     ):
         """初始化 HTTP server，并挂载配置和业务服务。"""
         super().__init__(server_address, handler_class)
         self.config = config
         self.service = service
+        self.bridge_server = bridge_server
         self.image_rate_limiter = ImageRateLimiter(
             config.image_rate_limit_per_minute,
             config.image_rate_limit_burst,
@@ -236,6 +436,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         """返回最小运维状态 JSON，便于探针和人工排查。"""
         try:
             payload = self.server.service.get_status_snapshot()
+            payload["http_watchdog"] = self.server.bridge_server.get_watchdog_snapshot()
         except Exception:
             LOGGER.exception("status endpoint failed")
             self._send_json(
@@ -341,3 +542,13 @@ class ImageRateLimiter:
         ]
         for key in stale_keys:
             self._buckets.pop(key, None)
+
+
+def _watchdog_probe_host(listen_host: str) -> str:
+    """把监听地址转换为 watchdog 从本机访问时使用的主机名。"""
+    host = str(listen_host or "").strip()
+    if host in {"", "0.0.0.0", "::"}:
+        return "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host

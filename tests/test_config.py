@@ -29,6 +29,10 @@ def test_load_creates_default_config_file(tmp_path: Path) -> None:
     assert data["external_url_base"] == ""
     assert data["image_rate_limit_per_minute"] == 60
     assert data["event_page_size"] == 1000
+    assert data["http_watchdog_interval_seconds"] == 10.0
+    assert data["http_watchdog_timeout_seconds"] == 3.0
+    assert data["http_watchdog_failure_threshold"] == 2
+    assert data["http_watchdog_restart_cooldown_seconds"] == 30.0
     assert data["event_table_column_widths"] == []
     assert data["partner_api_url"] == config.partner_api_url
     assert data["local_exit_hobby"] == "in"
@@ -52,6 +56,10 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
                 "local_entry_hobby": " Out ",
                 "local_entry_cid": "ENTRY-001",
                 "max_event_age_seconds": "30.5",
+                "http_watchdog_interval_seconds": "5.5",
+                "http_watchdog_timeout_seconds": "1.25",
+                "http_watchdog_failure_threshold": "4",
+                "http_watchdog_restart_cooldown_seconds": "15.0",
                 "image_rate_limit_per_minute": "90",
                 "event_page_size": "1000",
                 "db_path": "custom.sqlite3",
@@ -72,6 +80,10 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
     assert config.local_entry_hobby == "out"
     assert config.local_entry_cid == "ENTRY-001"
     assert config.max_event_age_seconds == 30.5
+    assert config.http_watchdog_interval_seconds == 5.5
+    assert config.http_watchdog_timeout_seconds == 1.25
+    assert config.http_watchdog_failure_threshold == 4
+    assert config.http_watchdog_restart_cooldown_seconds == 15.0
     assert config.image_rate_limit_per_minute == 90
     assert config.event_page_size == 1000
     assert config.db_path == Path("custom.sqlite3")
@@ -127,6 +139,24 @@ def test_read_from_path_rejects_invalid_event_page_size(tmp_path: Path) -> None:
     config_path.write_text(json.dumps({"event_page_size": 0}), encoding="utf-8")
 
     with pytest.raises(ValueError, match="event_page_size"):
+        AppConfig.read_from_path(config_path)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "http_watchdog_interval_seconds",
+        "http_watchdog_timeout_seconds",
+        "http_watchdog_failure_threshold",
+        "http_watchdog_restart_cooldown_seconds",
+    ],
+)
+def test_read_from_path_rejects_invalid_http_watchdog_values(tmp_path: Path, key: str) -> None:
+    """HTTP server 健康守护参数必须全部大于 0。"""
+    config_path = tmp_path / "bad-watchdog.json"
+    config_path.write_text(json.dumps({key: 0}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=key):
         AppConfig.read_from_path(config_path)
 
 

@@ -69,7 +69,17 @@ CONFIG_FIELD_GROUPS = [
     ),
     (
         "桥接与发送",
-        ("retry_count", "retry_delay_seconds", "request_timeout_seconds", "max_event_age_seconds", "event_page_size"),
+        (
+            "retry_count",
+            "retry_delay_seconds",
+            "request_timeout_seconds",
+            "max_event_age_seconds",
+            "http_watchdog_interval_seconds",
+            "http_watchdog_timeout_seconds",
+            "http_watchdog_failure_threshold",
+            "http_watchdog_restart_cooldown_seconds",
+            "event_page_size",
+        ),
     ),
 ]
 
@@ -93,6 +103,10 @@ CONFIG_FIELD_LABELS = {
     "retry_delay_seconds": "重试间隔秒",
     "request_timeout_seconds": "请求超时秒",
     "max_event_age_seconds": "过旧跳过秒数",
+    "http_watchdog_interval_seconds": "HTTP 守护探测间隔秒",
+    "http_watchdog_timeout_seconds": "HTTP 守护探测超时秒",
+    "http_watchdog_failure_threshold": "HTTP 守护失败次数",
+    "http_watchdog_restart_cooldown_seconds": "HTTP 守护重启冷却秒",
     "event_page_size": "每页记录数",
     "db_path": "数据库路径",
     "log_path": "日志路径",
@@ -117,6 +131,10 @@ CONFIG_FIELD_TOOLTIPS = {
     "retry_delay_seconds": "每次重试之间等待的秒数。",
     "request_timeout_seconds": "向大园区 API 发起 HTTP 请求时的超时秒数，必须大于 0。",
     "max_event_age_seconds": "过车时间相对收到时间超过这个秒数时，自动跳过发送，但仍会保留记录。",
+    "http_watchdog_interval_seconds": "HTTP server 运行时，每隔多少秒从本机探测一次 GET /。",
+    "http_watchdog_timeout_seconds": "HTTP server 健康探测的单次超时秒数，必须大于 0。",
+    "http_watchdog_failure_threshold": "连续多少次健康探测失败后，自动重启 HTTP server。",
+    "http_watchdog_restart_cooldown_seconds": "自动重启失败或刚重启后，至少等待多少秒才允许再次重启。",
     "event_page_size": "主列表每页显示的记录数；默认 1000，翻页可查看更旧记录。",
     "db_path": "SQLite 数据库文件路径；可通过配置文件修改，变更后需要重启程序生效。",
     "log_path": "程序日志文件路径；可通过配置文件修改，变更后需要重启程序生效。",
@@ -454,9 +472,16 @@ class ConfigDialog(QDialog):
                     continue
                 raise ValueError(f"{key} 不能为空")
             try:
-                if key in {"listen_port", "retry_count", "event_page_size"}:
+                if key in {"listen_port", "retry_count", "http_watchdog_failure_threshold", "event_page_size"}:
                     values[key] = int(text)
-                elif key in {"retry_delay_seconds", "request_timeout_seconds", "max_event_age_seconds"}:
+                elif key in {
+                    "retry_delay_seconds",
+                    "request_timeout_seconds",
+                    "max_event_age_seconds",
+                    "http_watchdog_interval_seconds",
+                    "http_watchdog_timeout_seconds",
+                    "http_watchdog_restart_cooldown_seconds",
+                }:
                     values[key] = float(text)
                 else:
                     values[key] = text
@@ -1366,16 +1391,20 @@ class MainWindow(QMainWindow):
 
     def toggle_server(self) -> None:
         """按当前运行状态切换 HTTP server 的开始或停止。"""
-        if self.http_server.is_running:
-            self.http_server.stop()
-            self._update_buttons()
-            return
-
+        self.server_button.setEnabled(False)
         try:
-            self.http_server.start()
-        except OSError as exc:
-            QMessageBox.critical(self, "启动失败", str(exc))
-        self._update_buttons()
+            if self.http_server.is_running:
+                self.http_server.stop()
+                return
+
+            try:
+                self.http_server.start()
+            except OSError as exc:
+                address = f"{self.http_server.config.listen_host}:{self.http_server.config.listen_port}"
+                QMessageBox.critical(self, "启动失败", f"无法启动 HTTP server：{address}\n\n{exc}")
+        finally:
+            self.server_button.setEnabled(True)
+            self._update_buttons()
 
     def go_first_page(self) -> None:
         """跳转到最新记录所在的第一页。"""
