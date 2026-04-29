@@ -230,6 +230,36 @@ def test_http_watchdog_restarts_after_consecutive_probe_failures(tmp_path: Path)
         manager.service.close()
 
 
+def test_http_watchdog_restarts_when_server_thread_is_dead(tmp_path: Path) -> None:
+    """接收线程异常退出但对象仍残留时，watchdog 应清理旧实例并重启。"""
+    manager = _bridge_server(
+        tmp_path,
+        listen_port=_free_tcp_port(),
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_restart_cooldown_seconds=0.5,
+    )
+    try:
+        manager.server.start()
+        stale_server = manager.server._server
+        stale_thread = manager.server._thread
+        assert stale_server is not None
+        assert stale_thread is not None
+
+        stale_server.shutdown()
+        stale_thread.join(timeout=3)
+        assert not stale_thread.is_alive()
+
+        assert _wait_until(lambda: manager.server.get_watchdog_snapshot()["restart_count"] >= 1)
+        assert manager.server.is_running is True
+        assert manager.server._server is not stale_server
+        with _open_url(_url(manager.server, "/healthz")) as response:
+            assert response.status == 200
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
 def test_http_watchdog_clears_single_failure_without_restart(tmp_path: Path) -> None:
     """一次失败后恢复成功时，watchdog 应清零失败计数且不重启。"""
     manager = _bridge_server(

@@ -90,7 +90,8 @@ class BridgeHTTPServer:
             self,
         )
         thread = threading.Thread(
-            target=server.serve_forever,
+            target=self._serve_forever,
+            args=(server,),
             name="hikvision-http-server",
             daemon=True,
         )
@@ -110,6 +111,18 @@ class BridgeHTTPServer:
             server.server_port,
         )
 
+    def _serve_forever(self, server: _ServiceHTTPServer) -> None:
+        """运行 HTTP server 主循环，并记录导致接收线程退出的异常。"""
+        try:
+            server.serve_forever()
+        except Exception:
+            with self._lock:
+                is_active_server = self._server is server
+            if is_active_server:
+                LOGGER.exception("HTTP server thread crashed")
+            else:
+                LOGGER.debug("HTTP server thread exited during server cleanup", exc_info=True)
+
     def _stop_current_server(self) -> None:
         """停止当前 HTTP server 实例，但不处理 watchdog 生命周期。"""
         with self._lock:
@@ -121,22 +134,33 @@ class BridgeHTTPServer:
         if server is None:
             return
 
-        shutdown_thread = threading.Thread(
-            target=server.shutdown,
-            name="hikvision-http-server-shutdown",
-            daemon=True,
-        )
-        shutdown_thread.start()
-        shutdown_thread.join(timeout=5)
-        if shutdown_thread.is_alive():
-            LOGGER.warning("HTTP server shutdown timed out; closing listening socket")
+        try:
+            thread_alive = thread is not None and thread.is_alive()
+            if thread_alive:
+                shutdown_thread = threading.Thread(
+                    target=server.shutdown,
+                    name="hikvision-http-server-shutdown",
+                    daemon=True,
+                )
+                try:
+                    shutdown_thread.start()
+                    shutdown_thread.join(timeout=5)
+                    if shutdown_thread.is_alive():
+                        LOGGER.warning("HTTP server shutdown timed out; closing listening socket")
+                except Exception:
+                    LOGGER.exception("failed to request HTTP server shutdown")
+            else:
+                LOGGER.warning("HTTP server thread already stopped; closing stale server socket")
 
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5)
-            if thread.is_alive():
-                LOGGER.warning("HTTP server thread did not exit within timeout")
-
-        server.server_close()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    LOGGER.warning("HTTP server thread did not exit within timeout")
+        finally:
+            try:
+                server.server_close()
+            except Exception:
+                LOGGER.exception("failed to close HTTP server socket")
         LOGGER.info("HTTP server stopped")
 
     def _cleanup_stopped_server_locked(self) -> None:
@@ -255,7 +279,10 @@ class BridgeHTTPServer:
             self._watchdog_next_restart_allowed_at = cooldown_until.isoformat(timespec="seconds")
 
         LOGGER.warning("HTTP server watchdog restarting server: %s", reason)
-        self._stop_current_server()
+        try:
+            self._stop_current_server()
+        except Exception:
+            LOGGER.exception("HTTP server watchdog failed while stopping stale server")
         try:
             with self._lock:
                 self._start_server_locked()
