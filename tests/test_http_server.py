@@ -260,6 +260,66 @@ def test_http_watchdog_restarts_when_server_thread_is_dead(tmp_path: Path) -> No
         manager.service.close()
 
 
+def test_http_server_closes_socket_when_thread_exits_without_bridge_stop(tmp_path: Path) -> None:
+    """serve_forever 提前返回时，应关闭监听 socket，避免端口假监听。"""
+    manager = _bridge_server(
+        tmp_path,
+        listen_port=_free_tcp_port(),
+        http_watchdog_interval_seconds=999.0,
+    )
+    try:
+        manager.server.start()
+        stale_server = manager.server._server
+        stale_thread = manager.server._thread
+        assert stale_server is not None
+        assert stale_thread is not None
+        port = stale_server.server_port
+        assert _tcp_port_accepts(port)
+
+        stale_server.shutdown()
+        stale_thread.join(timeout=3)
+        assert not stale_thread.is_alive()
+
+        assert _wait_until(
+            lambda: manager.server._server is None and not _tcp_port_accepts(port),
+            timeout=3.0,
+        )
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_survives_probe_exception(tmp_path: Path) -> None:
+    """watchdog 单次探测异常时，不应让 watchdog 线程静默退出。"""
+    manager = _bridge_server(
+        tmp_path,
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_failure_threshold=3,
+    )
+    calls = {"count": 0}
+
+    def fake_probe() -> tuple[bool, str]:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("simulated watchdog probe crash")
+        return True, ""
+
+    try:
+        manager.server.start()
+        manager.server._probe_http_root = fake_probe
+
+        assert _wait_until(lambda: calls["count"] >= 2)
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["enabled"] is True
+        assert snapshot["failure_count"] == 0
+        assert snapshot["restart_count"] == 0
+        assert snapshot["last_probe_error"] == ""
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
 def test_http_watchdog_clears_single_failure_without_restart(tmp_path: Path) -> None:
     """一次失败后恢复成功时，watchdog 应清零失败计数且不重启。"""
     manager = _bridge_server(
@@ -329,6 +389,15 @@ def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _tcp_port_accepts(port: int) -> bool:
+    """判断本机 TCP 端口是否仍可建立连接。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
 
 def _wait_until(predicate, timeout: float = 3.0) -> bool:

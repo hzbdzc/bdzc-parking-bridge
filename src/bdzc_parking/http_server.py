@@ -122,6 +122,22 @@ class BridgeHTTPServer:
                 LOGGER.exception("HTTP server thread crashed")
             else:
                 LOGGER.debug("HTTP server thread exited during server cleanup", exc_info=True)
+        finally:
+            self._handle_server_thread_exit(server)
+
+    def _handle_server_thread_exit(self, server: _ServiceHTTPServer) -> None:
+        """接收线程退出时关闭仍被当前对象持有的监听 socket。"""
+        with self._lock:
+            if self._server is not server:
+                return
+            self._server = None
+            self._thread = None
+
+        LOGGER.warning("HTTP server thread exited unexpectedly; closing stale listening socket")
+        try:
+            server.server_close()
+        except Exception:
+            LOGGER.exception("failed to close stale HTTP server socket after thread exit")
 
     def _stop_current_server(self) -> None:
         """停止当前 HTTP server 实例，但不处理 watchdog 生命周期。"""
@@ -172,7 +188,10 @@ class BridgeHTTPServer:
             return
 
         LOGGER.warning("HTTP server thread is not alive; cleaning up stale server state")
-        self._server.server_close()
+        try:
+            self._server.server_close()
+        except Exception:
+            LOGGER.exception("failed to close stale HTTP server socket")
         self._server = None
         self._thread = None
 
@@ -206,20 +225,31 @@ class BridgeHTTPServer:
     def _watchdog_loop(self) -> None:
         """周期性从本机探测 HTTP server，连续失败后自动重启。"""
         while not self._watchdog_stop_event.wait(self.config.http_watchdog_interval_seconds):
-            if self._is_server_thread_dead():
-                reason = "HTTP server thread is not alive"
-                self._record_watchdog_failure(reason)
-                self._restart_from_watchdog(reason)
-                continue
+            try:
+                self._watchdog_once()
+            except Exception as exc:
+                error = f"watchdog error: {type(exc).__name__}: {exc}"
+                LOGGER.exception("HTTP server watchdog loop failed")
+                failure_count = self._record_watchdog_failure(error)
+                if failure_count >= self.config.http_watchdog_failure_threshold:
+                    self._restart_from_watchdog(error)
 
-            ok, error = self._probe_http_root()
-            if ok:
-                self._record_watchdog_success()
-                continue
+    def _watchdog_once(self) -> None:
+        """执行一次 HTTP server 健康检查和必要的自动重启。"""
+        if self._is_server_thread_dead():
+            reason = "HTTP server thread is not alive"
+            self._record_watchdog_failure(reason)
+            self._restart_from_watchdog(reason)
+            return
 
-            failure_count = self._record_watchdog_failure(error)
-            if failure_count >= self.config.http_watchdog_failure_threshold:
-                self._restart_from_watchdog(error)
+        ok, error = self._probe_http_root()
+        if ok:
+            self._record_watchdog_success()
+            return
+
+        failure_count = self._record_watchdog_failure(error)
+        if failure_count >= self.config.http_watchdog_failure_threshold:
+            self._restart_from_watchdog(error)
 
     def _is_server_thread_dead(self) -> bool:
         """判断 server 对象仍存在但接收线程已经退出。"""
