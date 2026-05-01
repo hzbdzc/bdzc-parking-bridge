@@ -19,6 +19,7 @@ from bdzc_parking.models import HikEvent, SendResult
 
 LOGGER = logging.getLogger(__name__)
 SQLITE_BUSY_TIMEOUT_MS = 5000
+SQLITE_HEALTH_TIMEOUT_SECONDS = 1.0
 EVENT_FILTER_VALUE_LIMIT = 500
 EVENT_FILTER_COLUMNS = {
     "direction": "direction",
@@ -496,18 +497,31 @@ class EventStore:
 
     def probe_database_health(self) -> bool:
         """执行轻量 SQLite 读写探针，供 /healthz 判断数据库是否可用。"""
+        if not self._lock.acquire(timeout=SQLITE_HEALTH_TIMEOUT_SECONDS):
+            LOGGER.warning("database health probe timed out waiting for store lock")
+            return False
         try:
-            with self._lock:
-                conn = self._connect()
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
+                factory=_ClosingConnection,
+            )
+            try:
+                conn.execute(
+                    f"PRAGMA busy_timeout = {int(SQLITE_HEALTH_TIMEOUT_SECONDS * 1000)}"
+                )
+                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute("BEGIN IMMEDIATE")
                     conn.execute("SELECT 1")
-                    conn.execute("ROLLBACK")
                 finally:
-                    conn.close()
+                    conn.execute("ROLLBACK")
+            finally:
+                conn.close()
         except sqlite3.Error:
             LOGGER.exception("database health probe failed")
             return False
+        finally:
+            self._lock.release()
         return True
 
     def get_status_snapshot(self) -> dict[str, object]:

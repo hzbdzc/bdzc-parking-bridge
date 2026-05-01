@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import socket
 import threading
 import time
@@ -22,6 +23,12 @@ from bdzc_parking.service import ParkingBridgeService
 
 LOGGER = logging.getLogger(__name__)
 _RATE_LIMIT_STALE_SECONDS = 600.0
+_MAX_HEADER_COUNT = 100
+_MAX_HEADER_BYTES = 16 * 1024
+_MAX_REQUEST_PATH_CHARS = 2048
+_REQUEST_COUNTER = 0
+_REQUEST_COUNTER_LOCK = threading.Lock()
+_CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 
 
 class BridgeHTTPServer:
@@ -57,7 +64,6 @@ class BridgeHTTPServer:
             self._cleanup_stopped_server_locked()
             if self._server is None:
                 self._start_server_locked()
-            self._start_watchdog_locked()
 
     def stop(self) -> None:
         """停止 HTTP server 并等待后台线程退出。"""
@@ -106,9 +112,13 @@ class BridgeHTTPServer:
             raise
 
         LOGGER.info(
-            "HTTP server listening on %s:%s",
+            "HTTP server listening on %s:%s pid=%s server_id=%s thread_id=%s native_thread_id=%s",
             self.config.listen_host,
             server.server_port,
+            os.getpid(),
+            id(server),
+            thread.ident,
+            thread.native_id,
         )
 
     def _serve_forever(self, server: _ServiceHTTPServer) -> None:
@@ -122,6 +132,17 @@ class BridgeHTTPServer:
                 LOGGER.exception("HTTP server thread crashed")
             else:
                 LOGGER.debug("HTTP server thread exited during server cleanup", exc_info=True)
+        else:
+            with self._lock:
+                is_active_server = self._server is server
+            if is_active_server:
+                LOGGER.error(
+                    "HTTP server serve_forever returned without exception server_id=%s thread=%s",
+                    id(server),
+                    threading.current_thread().name,
+                )
+            else:
+                LOGGER.debug("HTTP server serve_forever returned after stop server_id=%s", id(server))
         finally:
             self._handle_server_thread_exit(server)
 
@@ -133,7 +154,10 @@ class BridgeHTTPServer:
             self._server = None
             self._thread = None
 
-        LOGGER.warning("HTTP server thread exited unexpectedly; closing stale listening socket")
+        LOGGER.warning(
+            "HTTP server thread exited unexpectedly; closing stale listening socket server_id=%s",
+            id(server),
+        )
         try:
             server.server_close()
         except Exception:
@@ -150,6 +174,11 @@ class BridgeHTTPServer:
         if server is None:
             return
 
+        LOGGER.info(
+            "HTTP server stop requested server_id=%s thread_alive=%s",
+            id(server),
+            thread is not None and thread.is_alive(),
+        )
         try:
             thread_alive = thread is not None and thread.is_alive()
             if thread_alive:
@@ -343,14 +372,102 @@ class _ServiceHTTPServer(ThreadingHTTPServer):
         bridge_server: BridgeHTTPServer,
     ):
         """初始化 HTTP server，并挂载配置和业务服务。"""
+        self.request_queue_size = max(1, int(config.http_request_queue_size))
         super().__init__(server_address, handler_class)
         self.config = config
         self.service = service
         self.bridge_server = bridge_server
+        self.max_connections = max(1, int(config.http_max_connections))
+        self._connection_slots = threading.BoundedSemaphore(self.max_connections)
+        self._connection_stats_lock = threading.Lock()
+        self._active_connections = 0
+        self._rejected_connections = 0
         self.image_rate_limiter = ImageRateLimiter(
             config.image_rate_limit_per_minute,
             config.image_rate_limit_burst,
         )
+
+    def process_request(self, request, client_address) -> None:
+        """在创建请求线程前限制并发连接数，避免慢连接耗尽线程。"""
+        if not self._connection_slots.acquire(blocking=False):
+            with self._connection_stats_lock:
+                self._rejected_connections += 1
+            self._send_busy_response(request, client_address)
+            self.close_request(request)
+            return
+        with self._connection_stats_lock:
+            self._active_connections += 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._release_connection_slot()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        """确保每个请求线程结束后归还并发槽位。"""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_connection_slot()
+
+    def _release_connection_slot(self) -> None:
+        """归还一个 HTTP 连接并发槽位，并维护运行计数。"""
+        with self._connection_stats_lock:
+            self._active_connections = max(0, self._active_connections - 1)
+        self._connection_slots.release()
+
+    def get_runtime_snapshot(self) -> dict[str, object]:
+        """返回 HTTP server 自身的连接与监听队列状态。"""
+        with self._connection_stats_lock:
+            active_connections = self._active_connections
+            rejected_connections = self._rejected_connections
+        return {
+            "max_connections": self.max_connections,
+            "active_connections": active_connections,
+            "rejected_connections": rejected_connections,
+            "request_queue_size": self.request_queue_size,
+        }
+
+    def handle_error(self, request, client_address) -> None:
+        """记录 handler 线程未捕获异常，避免静默吞掉请求级错误。"""
+        LOGGER.exception("uncaught HTTP handler error from %s", _client_address_text(client_address))
+
+    def _send_busy_response(self, request, client_address) -> None:
+        """并发过高时直接返回 503，保护业务处理线程池。"""
+        body = b"Busy"
+        response = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Connection: close\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
+            b"\r\n" + body
+        )
+        try:
+            request.settimeout(1.0)
+            request.sendall(response)
+            self._drain_rejected_request(request)
+        except _CLIENT_DISCONNECT_ERRORS:
+            LOGGER.debug("client disconnected before busy response: %s", _client_address_text(client_address))
+        except OSError:
+            LOGGER.warning("failed to send busy response to %s", _client_address_text(client_address), exc_info=True)
+
+    def _drain_rejected_request(self, request) -> None:
+        """短暂清理被拒请求的已到达数据，降低 Windows 上立即关闭导致 RST 的概率。"""
+        try:
+            request.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+
+        request.settimeout(0.05)
+        remaining = 16 * 1024
+        while remaining > 0:
+            try:
+                data = request.recv(min(4096, remaining))
+            except (OSError, socket.timeout):
+                break
+            if not data:
+                break
+            remaining -= len(data)
 
     def is_image_request(self, path: str) -> bool:
         """判断请求路径是否命中对外图片访问前缀。"""
@@ -377,8 +494,135 @@ class HikRequestHandler(BaseHTTPRequestHandler):
 
     server: _ServiceHTTPServer
 
+    def setup(self) -> None:
+        """初始化连接流，并给读写都设置超时。"""
+        super().setup()
+        try:
+            self.connection.settimeout(self.server.config.request_read_timeout_seconds)
+        except OSError:
+            LOGGER.debug("failed to set HTTP connection timeout", exc_info=True)
+
+    def handle_one_request(self) -> None:
+        """为单个 HTTP 请求建立完整的异常边界和访问日志。"""
+        self.request_id = _next_request_id()
+        self._request_started_at = time.monotonic()
+        self._request_body_length = 0
+        self._response_status: int | None = None
+        self._response_body_length = 0
+        try:
+            super().handle_one_request()
+        except _CLIENT_DISCONNECT_ERRORS as exc:
+            self._log_client_disconnect(exc)
+            self.close_connection = True
+        except socket.timeout:
+            LOGGER.warning(
+                "HTTP request timed out request_id=%s client=%s",
+                self.request_id,
+                self._client_ip(),
+            )
+            self.close_connection = True
+        except Exception:
+            LOGGER.exception(
+                "HTTP handler failed request_id=%s client=%s method=%s path=%s",
+                self.request_id,
+                self._client_ip(),
+                getattr(self, "command", "-"),
+                getattr(self, "path", "-"),
+            )
+            self._send_text(500, "Internal Server Error")
+            self.close_connection = True
+        finally:
+            self._log_request_summary()
+
+    def parse_request(self) -> bool:
+        """在标准库解析完成后追加生产运行所需的协议限制。"""
+        if not super().parse_request():
+            return False
+        if len(self.path) > _MAX_REQUEST_PATH_CHARS:
+            self.send_error(414, "URI Too Long")
+            return False
+
+        header_items = list(self.headers.raw_items())
+        if len(header_items) > _MAX_HEADER_COUNT:
+            self.send_error(431, "Too Many Request Headers")
+            return False
+
+        header_bytes = sum(len(name) + len(value) + 4 for name, value in header_items)
+        if header_bytes > _MAX_HEADER_BYTES:
+            self.send_error(431, "Request Header Fields Too Large")
+            return False
+        return True
+
     def do_GET(self) -> None:
         """响应健康检查和对外图片访问请求。"""
+        self._dispatch_request(self._handle_get_request)
+
+    def do_POST(self) -> None:
+        """接收海康 POST 上报的过车消息。"""
+        self._dispatch_request(self._handle_hikvision_event)
+
+    def do_PUT(self) -> None:
+        """接收海康 PUT 上报的过车消息。"""
+        self._dispatch_request(self._handle_hikvision_event)
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        """记录响应状态码，供请求结束日志使用。"""
+        self._response_status = code
+        super().send_response(code, message)
+
+    def send_error(
+        self,
+        code: int,
+        message: str | None = None,
+        explain: str | None = None,
+    ) -> None:
+        """发送错误响应，并把客户端断开降级记录。"""
+        self.close_connection = True
+        try:
+            super().send_error(code, message, explain)
+        except _CLIENT_DISCONNECT_ERRORS as exc:
+            self._log_client_disconnect(exc)
+            self.close_connection = True
+        except OSError:
+            LOGGER.warning(
+                "failed to send error response request_id=%s status=%s client=%s",
+                getattr(self, "request_id", "-"),
+                code,
+                self._client_ip(),
+                exc_info=True,
+            )
+            self.close_connection = True
+
+    def _dispatch_request(self, action) -> None:
+        """执行具体路由处理，并隔离所有请求级异常。"""
+        try:
+            action()
+        except _CLIENT_DISCONNECT_ERRORS as exc:
+            self._log_client_disconnect(exc)
+            self.close_connection = True
+        except socket.timeout:
+            LOGGER.warning(
+                "HTTP request processing timed out request_id=%s client=%s method=%s path=%s",
+                self.request_id,
+                self._client_ip(),
+                self.command,
+                self.path,
+            )
+            self._send_text(408, "Request Timeout")
+            self.close_connection = True
+        except Exception:
+            LOGGER.exception(
+                "HTTP request handling failed request_id=%s client=%s method=%s path=%s",
+                self.request_id,
+                self._client_ip(),
+                self.command,
+                self.path,
+            )
+            self._send_text(500, "Internal Server Error")
+            self.close_connection = True
+
+    def _handle_get_request(self) -> None:
+        """处理 GET 路由。"""
         path = urlsplit(self.path).path
         if path == "/":
             self._send_text(200, "BDZC Parking Bridge is running")
@@ -393,14 +637,6 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             self._handle_image_request(path)
             return
         self._send_text(404, "Not Found")
-
-    def do_POST(self) -> None:
-        """接收海康 POST 上报的过车消息。"""
-        self._handle_hikvision_event()
-
-    def do_PUT(self) -> None:
-        """接收海康 PUT 上报的过车消息。"""
-        self._handle_hikvision_event()
 
     def _handle_hikvision_event(self) -> None:
         """读取请求体并交给业务服务处理。"""
@@ -417,7 +653,6 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.connection.settimeout(self.server.config.request_read_timeout_seconds)
             body = self.rfile.read(length) if length > 0 else b""
         except (OSError, socket.timeout):
             LOGGER.warning("request body read timed out: %s %s", self.command, self.path)
@@ -438,11 +673,13 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             length,
             content_type or "-",
         )
-        try:
-            self.server.service.handle_request(content_type, body, client_ip=client_ip)
-        except Exception:
-            LOGGER.exception("request handling failed")
-            self._send_text(500, "Internal Server Error")
+        if not self.server.service.enqueue_http_request(
+            content_type,
+            body,
+            client_ip=client_ip,
+            request_id=self.request_id,
+        ):
+            self._send_text(503, "Busy")
             return
         self._send_text(200, "OK")
 
@@ -494,6 +731,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self.server.service.get_status_snapshot()
             payload["http_watchdog"] = self.server.bridge_server.get_watchdog_snapshot()
+            payload["http_server"] = self.server.get_runtime_snapshot()
         except Exception:
             LOGGER.exception("status endpoint failed")
             self._send_json(
@@ -522,6 +760,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         if length < 0:
             self._send_text(400, "Invalid Content-Length")
             return None
+        self._request_body_length = length
         return length
 
     def _send_text(self, status_code: int, body: str) -> None:
@@ -535,11 +774,61 @@ class HikRequestHandler(BaseHTTPRequestHandler):
 
     def _send_bytes(self, status_code: int, body: bytes, content_type: str) -> None:
         """发送二进制响应。"""
-        self.send_response(status_code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._response_body_length = len(body)
+        self.close_connection = True
+        try:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except _CLIENT_DISCONNECT_ERRORS as exc:
+            self._log_client_disconnect(exc)
+            self.close_connection = True
+        except OSError:
+            LOGGER.warning(
+                "failed to write HTTP response request_id=%s status=%s client=%s",
+                getattr(self, "request_id", "-"),
+                status_code,
+                self._client_ip(),
+                exc_info=True,
+            )
+            self.close_connection = True
+
+    def _log_client_disconnect(self, exc: BaseException) -> None:
+        """把客户端主动断开记录为低噪声日志。"""
+        LOGGER.debug(
+            "client disconnected request_id=%s client=%s method=%s path=%s error=%s: %s",
+            getattr(self, "request_id", "-"),
+            self._client_ip(),
+            getattr(self, "command", "-"),
+            getattr(self, "path", "-"),
+            type(exc).__name__,
+            exc,
+        )
+
+    def _log_request_summary(self) -> None:
+        """记录单次请求的核心信息和耗时。"""
+        requestline = getattr(self, "requestline", "")
+        if not requestline:
+            return
+        elapsed_ms = (time.monotonic() - self._request_started_at) * 1000.0
+        LOGGER.info(
+            "HTTP request request_id=%s client=%s method=%s path=%s status=%s request_bytes=%s response_bytes=%s elapsed_ms=%.1f",
+            self.request_id,
+            self._client_ip(),
+            getattr(self, "command", "-"),
+            getattr(self, "path", "-"),
+            self._response_status if self._response_status is not None else "-",
+            self._request_body_length,
+            self._response_body_length,
+            elapsed_ms,
+        )
+
+    def _client_ip(self) -> str:
+        """返回当前请求客户端 IP。"""
+        return self.client_address[0] if self.client_address else "unknown"
 
     def log_message(self, fmt: str, *args: object) -> None:
         """把 BaseHTTPRequestHandler 的访问日志接入项目 logger。"""
@@ -609,3 +898,20 @@ def _watchdog_probe_host(listen_host: str) -> str:
     if ":" in host and not host.startswith("["):
         return f"[{host}]"
     return host
+
+
+def _next_request_id() -> int:
+    """生成进程内单调递增的 HTTP 请求编号，便于关联日志。"""
+    global _REQUEST_COUNTER
+    with _REQUEST_COUNTER_LOCK:
+        _REQUEST_COUNTER += 1
+        return _REQUEST_COUNTER
+
+
+def _client_address_text(client_address: object) -> str:
+    """把 socketserver 的客户端地址转换为日志文本。"""
+    if isinstance(client_address, tuple) and client_address:
+        host = str(client_address[0])
+        port = client_address[1] if len(client_address) > 1 else ""
+        return f"{host}:{port}" if port != "" else host
+    return str(client_address or "unknown")

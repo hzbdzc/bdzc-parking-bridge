@@ -29,6 +29,10 @@ def test_load_creates_default_config_file(tmp_path: Path) -> None:
     assert data["external_url_base"] == ""
     assert data["image_rate_limit_per_minute"] == 60
     assert data["event_page_size"] == 1000
+    assert data["http_max_connections"] == 64
+    assert data["http_request_queue_size"] == 128
+    assert data["http_ingress_queue_size"] == 256
+    assert data["http_ingress_workers"] == 1
     assert data["http_watchdog_interval_seconds"] == 10.0
     assert data["http_watchdog_timeout_seconds"] == 3.0
     assert data["http_watchdog_failure_threshold"] == 2
@@ -56,6 +60,10 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
                 "local_entry_hobby": " Out ",
                 "local_entry_cid": "ENTRY-001",
                 "max_event_age_seconds": "30.5",
+                "http_max_connections": "32",
+                "http_request_queue_size": "96",
+                "http_ingress_queue_size": "128",
+                "http_ingress_workers": "2",
                 "http_watchdog_interval_seconds": "5.5",
                 "http_watchdog_timeout_seconds": "1.25",
                 "http_watchdog_failure_threshold": "4",
@@ -80,6 +88,10 @@ def test_load_updates_from_existing_config_file(tmp_path: Path) -> None:
     assert config.local_entry_hobby == "out"
     assert config.local_entry_cid == "ENTRY-001"
     assert config.max_event_age_seconds == 30.5
+    assert config.http_max_connections == 32
+    assert config.http_request_queue_size == 96
+    assert config.http_ingress_queue_size == 128
+    assert config.http_ingress_workers == 2
     assert config.http_watchdog_interval_seconds == 5.5
     assert config.http_watchdog_timeout_seconds == 1.25
     assert config.http_watchdog_failure_threshold == 4
@@ -145,14 +157,18 @@ def test_read_from_path_rejects_invalid_event_page_size(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "key",
     [
+        "http_max_connections",
+        "http_request_queue_size",
+        "http_ingress_queue_size",
+        "http_ingress_workers",
         "http_watchdog_interval_seconds",
         "http_watchdog_timeout_seconds",
         "http_watchdog_failure_threshold",
         "http_watchdog_restart_cooldown_seconds",
     ],
 )
-def test_read_from_path_rejects_invalid_http_watchdog_values(tmp_path: Path, key: str) -> None:
-    """HTTP server 健康守护参数必须全部大于 0。"""
+def test_read_from_path_rejects_invalid_http_runtime_values(tmp_path: Path, key: str) -> None:
+    """HTTP server 运行参数必须全部大于 0。"""
     config_path = tmp_path / "bad-watchdog.json"
     config_path.write_text(json.dumps({key: 0}), encoding="utf-8")
 

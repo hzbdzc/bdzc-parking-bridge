@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from bdzc_parking.config import AppConfig
@@ -19,9 +20,20 @@ from bdzc_parking.storage import EventStore, load_partner_payload
 LOGGER = logging.getLogger(__name__)
 Listener = Callable[[int], None]
 _QUEUE_SENTINEL = -1
+_HTTP_INGRESS_SENTINEL = object()
 _MAINTENANCE_INTERVAL_SECONDS = 0.5
 _CLEANUP_INTERVAL_SECONDS = 3600.0
 _RETRY_DELAYS_SECONDS = (1.0, 5.0, 10.0)
+
+
+@dataclass(frozen=True)
+class _HttpIngressRequest:
+    """HTTP 接收线程交给后台 worker 的原始请求任务。"""
+
+    content_type: str
+    body: bytes
+    client_ip: str
+    request_id: int | str
 
 
 class ParkingBridgeService:
@@ -40,11 +52,19 @@ class ParkingBridgeService:
         self._maintenance_wakeup = threading.Event()
         self._send_queue: queue.Queue[int] = queue.Queue(maxsize=self.config.sender_queue_size)
         self._workers: list[threading.Thread] = []
+        self._http_ingress_queue: queue.Queue[_HttpIngressRequest | object] = queue.Queue(
+            maxsize=self.config.http_ingress_queue_size
+        )
+        self._http_ingress_workers: list[threading.Thread] = []
+        self._http_ingress_lock = threading.Lock()
+        self._http_ingress_active_count = 0
+        self._http_ingress_rejected_count = 0
 
         recovered = self.store.recover_stale_sending(self.config.stale_sending_seconds)
         if recovered:
             LOGGER.warning("recovered %s stale sending records", recovered)
 
+        self._start_http_ingress_workers()
         self._start_workers()
         self._run_cleanup()
         self._schedule_pending_events()
@@ -61,11 +81,18 @@ class ParkingBridgeService:
             return
         self._stop_event.set()
         self._maintenance_wakeup.set()
+        for _ in self._http_ingress_workers:
+            try:
+                self._http_ingress_queue.put_nowait(_HTTP_INGRESS_SENTINEL)
+            except queue.Full:
+                break
         for _ in self._workers:
             try:
                 self._send_queue.put_nowait(_QUEUE_SENTINEL)
             except queue.Full:
                 break
+        for worker in self._http_ingress_workers:
+            worker.join(timeout=2)
         for worker in self._workers:
             worker.join(timeout=2)
         self._maintenance_thread.join(timeout=2)
@@ -118,6 +145,29 @@ class ParkingBridgeService:
         elif not created:
             LOGGER.info("duplicate event ignored: %s", event.event_key)
 
+    def enqueue_http_request(
+        self,
+        content_type: str,
+        body: bytes,
+        client_ip: str = "unknown",
+        request_id: int | str = "-",
+    ) -> bool:
+        """把 HTTP 收到的原始请求放入有界接收队列，队列满时返回 False。"""
+        item = _HttpIngressRequest(content_type, bytes(body), client_ip, request_id)
+        try:
+            self._http_ingress_queue.put_nowait(item)
+        except queue.Full:
+            with self._http_ingress_lock:
+                self._http_ingress_rejected_count += 1
+            LOGGER.warning(
+                "HTTP ingress queue is full request_id=%s client=%s size=%s",
+                request_id,
+                client_ip,
+                self.config.http_ingress_queue_size,
+            )
+            return False
+        return True
+
     def send_record_async(self, event_id: int) -> None:
         """把指定事件加入后台发送队列。"""
         self._schedule_send(event_id)
@@ -158,6 +208,7 @@ class ParkingBridgeService:
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "server_running": True,
                 "queue_length": self._send_queue.qsize(),
+                **self.get_http_ingress_snapshot(),
             }
         )
         return snapshot
@@ -165,6 +216,22 @@ class ParkingBridgeService:
     def is_database_healthy(self) -> bool:
         """检查 SQLite 是否可正常响应，供 /healthz 使用。"""
         return self.store.probe_database_health()
+
+    def get_http_ingress_snapshot(self) -> dict[str, object]:
+        """返回 HTTP 接收队列和后台 worker 的运行状态。"""
+        with self._http_ingress_lock:
+            active_count = self._http_ingress_active_count
+            rejected_count = self._http_ingress_rejected_count
+        return {
+            "http_ingress_queue_length": self._http_ingress_queue.qsize(),
+            "http_ingress_queue_size": self.config.http_ingress_queue_size,
+            "http_ingress_workers_alive": sum(
+                1 for worker in self._http_ingress_workers if worker.is_alive()
+            ),
+            "http_ingress_worker_count": len(self._http_ingress_workers),
+            "http_ingress_active_requests": active_count,
+            "http_ingress_rejected_count": rejected_count,
+        }
 
     def manual_resend(self, event_id: int) -> None:
         """把可重发记录改回待发送状态，并异步重新发送。"""
@@ -200,6 +267,55 @@ class ParkingBridgeService:
             )
             worker.start()
             self._workers.append(worker)
+
+    def _start_http_ingress_workers(self) -> None:
+        """启动固定数量的 HTTP 接收 worker。"""
+        for index in range(self.config.http_ingress_workers):
+            worker = threading.Thread(
+                target=self._http_ingress_worker_loop,
+                name=f"http-ingress-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._http_ingress_workers.append(worker)
+
+    def _http_ingress_worker_loop(self) -> None:
+        """循环消费 HTTP 原始请求队列，隔离慢业务和 HTTP 请求线程。"""
+        while True:
+            try:
+                item = self._http_ingress_queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            if item is _HTTP_INGRESS_SENTINEL:
+                self._http_ingress_queue.task_done()
+                break
+            if not isinstance(item, _HttpIngressRequest):
+                self._http_ingress_queue.task_done()
+                continue
+
+            with self._http_ingress_lock:
+                self._http_ingress_active_count += 1
+            try:
+                LOGGER.debug(
+                    "HTTP ingress worker handling request_id=%s client=%s bytes=%s",
+                    item.request_id,
+                    item.client_ip,
+                    len(item.body),
+                )
+                self.handle_request(item.content_type, item.body, client_ip=item.client_ip)
+            except Exception:
+                LOGGER.exception(
+                    "HTTP ingress worker failed request_id=%s client=%s",
+                    item.request_id,
+                    item.client_ip,
+                )
+            finally:
+                with self._http_ingress_lock:
+                    self._http_ingress_active_count -= 1
+                self._http_ingress_queue.task_done()
 
     def _send_worker_loop(self) -> None:
         """循环消费发送队列中的待发送记录。"""

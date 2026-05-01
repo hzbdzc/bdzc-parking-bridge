@@ -33,6 +33,10 @@ CONFIG_VALUE_KEYS = {
     "max_event_age_seconds",
     "max_request_bytes",
     "request_read_timeout_seconds",
+    "http_max_connections",
+    "http_request_queue_size",
+    "http_ingress_queue_size",
+    "http_ingress_workers",
     "http_watchdog_interval_seconds",
     "http_watchdog_timeout_seconds",
     "http_watchdog_failure_threshold",
@@ -75,6 +79,10 @@ class AppConfig:
     max_event_age_seconds: float = 60.0
     max_request_bytes: int = 1_048_576
     request_read_timeout_seconds: float = 15.0
+    http_max_connections: int = 64
+    http_request_queue_size: int = 128
+    http_ingress_queue_size: int = 256
+    http_ingress_workers: int = 1
     http_watchdog_interval_seconds: float = 10.0
     http_watchdog_timeout_seconds: float = 3.0
     http_watchdog_failure_threshold: int = 2
@@ -154,6 +162,10 @@ class AppConfig:
             "max_event_age_seconds": self.max_event_age_seconds,
             "max_request_bytes": self.max_request_bytes,
             "request_read_timeout_seconds": self.request_read_timeout_seconds,
+            "http_max_connections": self.http_max_connections,
+            "http_request_queue_size": self.http_request_queue_size,
+            "http_ingress_queue_size": self.http_ingress_queue_size,
+            "http_ingress_workers": self.http_ingress_workers,
             "http_watchdog_interval_seconds": self.http_watchdog_interval_seconds,
             "http_watchdog_timeout_seconds": self.http_watchdog_timeout_seconds,
             "http_watchdog_failure_threshold": self.http_watchdog_failure_threshold,
@@ -229,6 +241,14 @@ class AppConfig:
             raise ValueError("max_request_bytes 必须大于 0")
         if self.request_read_timeout_seconds <= 0:
             raise ValueError("request_read_timeout_seconds 必须大于 0")
+        if self.http_max_connections <= 0:
+            raise ValueError("http_max_connections 必须大于 0")
+        if self.http_request_queue_size <= 0:
+            raise ValueError("http_request_queue_size 必须大于 0")
+        if self.http_ingress_queue_size <= 0:
+            raise ValueError("http_ingress_queue_size 必须大于 0")
+        if self.http_ingress_workers <= 0:
+            raise ValueError("http_ingress_workers 必须大于 0")
         if self.http_watchdog_interval_seconds <= 0:
             raise ValueError("http_watchdog_interval_seconds 必须大于 0")
         if self.http_watchdog_timeout_seconds <= 0:
@@ -297,6 +317,10 @@ def _coerce_value(key: str, value: Any) -> object:
         "retry_count",
         "http_watchdog_failure_threshold",
         "max_request_bytes",
+        "http_max_connections",
+        "http_request_queue_size",
+        "http_ingress_queue_size",
+        "http_ingress_workers",
         "sender_worker_count",
         "sender_queue_size",
         "event_retention_days",

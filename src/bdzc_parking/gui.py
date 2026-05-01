@@ -74,6 +74,11 @@ CONFIG_FIELD_GROUPS = [
             "retry_delay_seconds",
             "request_timeout_seconds",
             "max_event_age_seconds",
+            "request_read_timeout_seconds",
+            "http_max_connections",
+            "http_request_queue_size",
+            "http_ingress_queue_size",
+            "http_ingress_workers",
             "http_watchdog_interval_seconds",
             "http_watchdog_timeout_seconds",
             "http_watchdog_failure_threshold",
@@ -103,6 +108,11 @@ CONFIG_FIELD_LABELS = {
     "retry_delay_seconds": "重试间隔秒",
     "request_timeout_seconds": "请求超时秒",
     "max_event_age_seconds": "过旧跳过秒数",
+    "request_read_timeout_seconds": "HTTP 读取超时秒",
+    "http_max_connections": "HTTP 最大连接数",
+    "http_request_queue_size": "HTTP 监听队列长度",
+    "http_ingress_queue_size": "HTTP 接收队列长度",
+    "http_ingress_workers": "HTTP 接收 worker 数",
     "http_watchdog_interval_seconds": "HTTP 守护探测间隔秒",
     "http_watchdog_timeout_seconds": "HTTP 守护探测超时秒",
     "http_watchdog_failure_threshold": "HTTP 守护失败次数",
@@ -131,6 +141,11 @@ CONFIG_FIELD_TOOLTIPS = {
     "retry_delay_seconds": "每次重试之间等待的秒数。",
     "request_timeout_seconds": "向大园区 API 发起 HTTP 请求时的超时秒数，必须大于 0。",
     "max_event_age_seconds": "过车时间相对收到时间超过这个秒数时，自动跳过发送，但仍会保留记录。",
+    "request_read_timeout_seconds": "读取海康 HTTP 请求头和请求体的 socket 超时秒数，必须大于 0。",
+    "http_max_connections": "HTTP server 同时处理的连接上限；修改后需要重启 HTTP server 生效。",
+    "http_request_queue_size": "操作系统监听 backlog 上限；修改后需要重启 HTTP server 生效。",
+    "http_ingress_queue_size": "已接收但尚未进入业务解析的 /park 内存队列长度；修改后需要重启程序生效。",
+    "http_ingress_workers": "消费 HTTP 接收队列的后台 worker 数；修改后需要重启程序生效。",
     "http_watchdog_interval_seconds": "HTTP server 运行时，每隔多少秒从本机探测一次 GET /。",
     "http_watchdog_timeout_seconds": "HTTP server 健康探测的单次超时秒数，必须大于 0。",
     "http_watchdog_failure_threshold": "连续多少次健康探测失败后，自动重启 HTTP server。",
@@ -485,12 +500,22 @@ class ConfigDialog(QDialog):
                     continue
                 raise ValueError(f"{key} 不能为空")
             try:
-                if key in {"listen_port", "retry_count", "http_watchdog_failure_threshold", "event_page_size"}:
+                if key in {
+                    "listen_port",
+                    "retry_count",
+                    "http_max_connections",
+                    "http_request_queue_size",
+                    "http_ingress_queue_size",
+                    "http_ingress_workers",
+                    "http_watchdog_failure_threshold",
+                    "event_page_size",
+                }:
                     values[key] = int(text)
                 elif key in {
                     "retry_delay_seconds",
                     "request_timeout_seconds",
                     "max_event_age_seconds",
+                    "request_read_timeout_seconds",
                     "http_watchdog_interval_seconds",
                     "http_watchdog_timeout_seconds",
                     "http_watchdog_restart_cooldown_seconds",
@@ -515,8 +540,15 @@ class ConfigDialog(QDialog):
         if self.http_server.is_running and (
             previous.listen_host != self.http_server.config.listen_host
             or previous.listen_port != self.http_server.config.listen_port
+            or previous.http_max_connections != self.http_server.config.http_max_connections
+            or previous.http_request_queue_size != self.http_server.config.http_request_queue_size
         ):
-            notices.append("监听地址或端口变更需要停止并重新开始 HTTP server 后生效。")
+            notices.append("HTTP 监听参数变更需要停止并重新开始 HTTP server 后生效。")
+        if (
+            previous.http_ingress_queue_size != self.http_server.config.http_ingress_queue_size
+            or previous.http_ingress_workers != self.http_server.config.http_ingress_workers
+        ):
+            notices.append("HTTP 接收队列或 worker 数变更需要重启程序后生效。")
         if previous.listen_path != self.http_server.config.listen_path:
             notices.append("接收路径变更会立即影响后续进入程序的 HTTP 请求。")
         if previous.external_url_base != self.http_server.config.external_url_base:
@@ -528,7 +560,6 @@ class ConfigDialog(QDialog):
         if previous.auto_start_server != self.http_server.config.auto_start_server:
             notices.append("自动开启 HTTP server 会在下次程序启动时生效。")
         return notices
-
 
     def reject(self) -> None:
         """取消配置编辑，回滚本次弹窗期间对共享配置的所有未保存变动。"""

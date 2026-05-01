@@ -6,6 +6,7 @@ import http.client
 import json
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bdzc_parking.config import AppConfig
+import bdzc_parking.http_server as http_server_module
 from bdzc_parking.http_server import BridgeHTTPServer
 from bdzc_parking.models import SendResult
 from bdzc_parking.service import ParkingBridgeService
@@ -96,6 +98,7 @@ def test_root_route_still_returns_plain_text(tmp_path: Path) -> None:
             assert response.status == 200
             assert response.read().decode("utf-8") == "BDZC Parking Bridge is running"
             assert response.headers["Content-Type"] == "text/plain; charset=utf-8"
+            assert response.headers["Connection"].lower() == "close"
 
 
 def test_healthz_returns_json_when_database_is_healthy(tmp_path: Path) -> None:
@@ -116,6 +119,16 @@ def test_healthz_returns_503_when_database_probe_fails(tmp_path: Path) -> None:
 
         with pytest_raises_http_error(503):
             _open_url(_url(server, "/healthz"))
+
+
+def test_healthz_times_out_when_store_lock_is_busy(tmp_path: Path) -> None:
+    """数据库锁被业务占用时，/healthz 应快速返回 503 而不是一直等待。"""
+    with _bridge_server(tmp_path) as server:
+        started_at = time.monotonic()
+        with server.service.store._lock:
+            with pytest_raises_http_error(503):
+                _open_url(_url(server, "/healthz"))
+        assert time.monotonic() - started_at < 2.5
 
 
 def test_status_returns_failure_backlog_and_database_size(tmp_path: Path) -> None:
@@ -151,13 +164,20 @@ def test_status_returns_failure_backlog_and_database_size(tmp_path: Path) -> Non
             assert response.status == 200
             assert payload["server_running"] is True
             assert payload["queue_length"] == 0
+            assert payload["http_ingress_queue_length"] == 0
+            assert payload["http_ingress_queue_size"] == server.config.http_ingress_queue_size
+            assert payload["http_ingress_workers_alive"] == server.config.http_ingress_workers
+            assert payload["http_ingress_active_requests"] == 0
+            assert payload["http_ingress_rejected_count"] == 0
+            assert payload["http_server"]["max_connections"] == server.config.http_max_connections
+            assert payload["http_server"]["request_queue_size"] == server.config.http_request_queue_size
             assert payload["last_success_sent_at"] == now
             assert payload["failed_retryable_count"] == 1
             assert payload["dead_letter_count"] == 1
             assert payload["failure_backlog_count"] == 2
             assert payload["db_main_size_bytes"] > 0
             assert payload["db_total_size_bytes"] >= payload["db_main_size_bytes"]
-            assert payload["http_watchdog"]["enabled"] is True
+            assert payload["http_watchdog"]["enabled"] is False
             assert payload["http_watchdog"]["failure_count"] == 0
             assert payload["http_watchdog"]["restart_count"] == 0
 
@@ -177,82 +197,6 @@ def test_http_server_can_restart_on_same_configured_port(tmp_path: Path) -> None
         manager.server.start()
         assert manager.server._server is not None
         assert manager.server._server.server_port == port
-        with _open_url(_url(manager.server, "/healthz")) as response:
-            assert response.status == 200
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-
-def test_http_watchdog_starts_and_stops_with_server(tmp_path: Path) -> None:
-    """HTTP server 启停时，watchdog 应同步启停且手动停止后不自动拉起。"""
-    manager = _bridge_server(
-        tmp_path,
-        http_watchdog_interval_seconds=0.05,
-        http_watchdog_timeout_seconds=0.05,
-    )
-    try:
-        manager.server.start()
-        assert manager.server.get_watchdog_snapshot()["enabled"] is True
-
-        manager.server.stop()
-        assert manager.server.get_watchdog_snapshot()["enabled"] is False
-        assert manager.server.is_running is False
-        time.sleep(0.15)
-        assert manager.server.is_running is False
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-
-def test_http_watchdog_restarts_after_consecutive_probe_failures(tmp_path: Path) -> None:
-    """连续探测失败达到阈值后，watchdog 应自动重启 HTTP server。"""
-    manager = _bridge_server(
-        tmp_path,
-        listen_port=_free_tcp_port(),
-        http_watchdog_interval_seconds=0.05,
-        http_watchdog_timeout_seconds=0.05,
-        http_watchdog_failure_threshold=2,
-        http_watchdog_restart_cooldown_seconds=0.5,
-    )
-    try:
-        manager.server.start()
-        manager.server._probe_http_root = lambda: (False, "simulated probe failure")
-
-        assert _wait_until(lambda: manager.server.get_watchdog_snapshot()["restart_count"] >= 1)
-        with _open_url(_url(manager.server, "/")) as response:
-            assert response.status == 200
-        with _open_url(_url(manager.server, "/status")) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            assert payload["http_watchdog"]["restart_count"] >= 1
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-
-def test_http_watchdog_restarts_when_server_thread_is_dead(tmp_path: Path) -> None:
-    """接收线程异常退出但对象仍残留时，watchdog 应清理旧实例并重启。"""
-    manager = _bridge_server(
-        tmp_path,
-        listen_port=_free_tcp_port(),
-        http_watchdog_interval_seconds=0.05,
-        http_watchdog_timeout_seconds=0.05,
-        http_watchdog_restart_cooldown_seconds=0.5,
-    )
-    try:
-        manager.server.start()
-        stale_server = manager.server._server
-        stale_thread = manager.server._thread
-        assert stale_server is not None
-        assert stale_thread is not None
-
-        stale_server.shutdown()
-        stale_thread.join(timeout=3)
-        assert not stale_thread.is_alive()
-
-        assert _wait_until(lambda: manager.server.get_watchdog_snapshot()["restart_count"] >= 1)
-        assert manager.server.is_running is True
-        assert manager.server._server is not stale_server
         with _open_url(_url(manager.server, "/healthz")) as response:
             assert response.status == 200
     finally:
@@ -289,65 +233,161 @@ def test_http_server_closes_socket_when_thread_exits_without_bridge_stop(tmp_pat
         manager.service.close()
 
 
-def test_http_watchdog_survives_probe_exception(tmp_path: Path) -> None:
-    """watchdog 单次探测异常时，不应让 watchdog 线程静默退出。"""
+def test_http_server_rejects_missing_content_length(tmp_path: Path) -> None:
+    """POST /park 缺少 Content-Length 时应快速返回 400。"""
+    with _bridge_server(tmp_path) as server:
+        connection = http.client.HTTPConnection("127.0.0.1", server._server.server_port, timeout=5)
+        try:
+            connection.putrequest("POST", "/park")
+            connection.putheader("Content-Type", "application/json")
+            connection.endheaders()
+            response = connection.getresponse()
+            assert response.status == 400
+        finally:
+            connection.close()
+
+
+def test_http_server_records_parse_error_for_invalid_json(tmp_path: Path) -> None:
+    """非法 JSON 不应影响 HTTP server，应由业务层记录 parse_error 并返回 200。"""
+    with _bridge_server(tmp_path) as server:
+        connection = http.client.HTTPConnection("127.0.0.1", server._server.server_port, timeout=5)
+        try:
+            connection.request(
+                "POST",
+                "/park",
+                body=b"not-json",
+                headers={"Content-Type": "application/json", "Content-Length": "8"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+        finally:
+            connection.close()
+
+        assert _wait_until(lambda: bool(server.service.store.list_events()))
+        rows = server.service.store.list_events()
+        assert rows
+        assert rows[0]["status"] == "parse_error"
+
+
+def test_http_server_rejects_too_long_path(tmp_path: Path) -> None:
+    """请求路径超过限制时应返回 414，避免异常路径消耗资源。"""
+    with _bridge_server(tmp_path) as server:
+        path = "/" + ("x" * (http_server_module._MAX_REQUEST_PATH_CHARS + 1))
+        status = _raw_http_status(server._server.server_port, f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert status == 414
+
+
+def test_http_server_rejects_large_headers(tmp_path: Path) -> None:
+    """header 总长度超过限制时应返回 431。"""
+    with _bridge_server(tmp_path) as server:
+        value = "x" * (http_server_module._MAX_HEADER_BYTES + 1)
+        request = f"GET / HTTP/1.1\r\nHost: x\r\nX-Large: {value}\r\n\r\n"
+        status = _raw_http_status(server._server.server_port, request)
+        assert status == 431
+
+
+def test_http_server_returns_busy_when_concurrency_limit_exceeded(tmp_path: Path) -> None:
+    """慢连接占满并发槽位时，新连接应收到 503 Busy。"""
     manager = _bridge_server(
         tmp_path,
-        http_watchdog_interval_seconds=0.05,
-        http_watchdog_timeout_seconds=0.05,
-        http_watchdog_failure_threshold=3,
+        http_max_connections=1,
+        request_read_timeout_seconds=2.0,
     )
-    calls = {"count": 0}
-
-    def fake_probe() -> tuple[bool, str]:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("simulated watchdog probe crash")
-        return True, ""
-
     try:
         manager.server.start()
-        manager.server._probe_http_root = fake_probe
+        port = manager.server._server.server_port
+        first = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            first.sendall(
+                b"POST /park HTTP/1.1\r\n"
+                b"Host: x\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 1\r\n"
+                b"\r\n"
+            )
+            time.sleep(0.2)
+            status = _raw_http_status(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            assert status == 503
+        finally:
+            first.close()
 
-        assert _wait_until(lambda: calls["count"] >= 2)
-        snapshot = manager.server.get_watchdog_snapshot()
-        assert snapshot["enabled"] is True
-        assert snapshot["failure_count"] == 0
-        assert snapshot["restart_count"] == 0
-        assert snapshot["last_probe_error"] == ""
+        assert _wait_until(lambda: _root_is_healthy(port), timeout=3.0)
     finally:
         manager.server.stop()
         manager.service.close()
 
 
-def test_http_watchdog_clears_single_failure_without_restart(tmp_path: Path) -> None:
-    """一次失败后恢复成功时，watchdog 应清零失败计数且不重启。"""
+def test_park_request_returns_after_ingress_enqueue(tmp_path: Path) -> None:
+    """慢业务处理应由 ingress worker 执行，不占住 HTTP 请求线程。"""
+    with _bridge_server(tmp_path) as server:
+        called = threading.Event()
+        release = threading.Event()
+
+        def slow_handle_request(content_type: str, body: bytes, client_ip: str = "unknown") -> None:
+            called.set()
+            release.wait(timeout=3)
+
+        server.service.handle_request = slow_handle_request
+        started_at = time.monotonic()
+        try:
+            status = _post_park(server._server.server_port, b"{}")
+            elapsed = time.monotonic() - started_at
+            assert status == 200
+            assert elapsed < 0.5
+            assert _wait_until(called.is_set)
+        finally:
+            release.set()
+
+
+def test_park_ingress_queue_full_returns_busy_without_blocking_healthz(tmp_path: Path) -> None:
+    """业务接收队列满时 /park 返回 503，但 /healthz 仍绕开业务队列。"""
     manager = _bridge_server(
         tmp_path,
-        http_watchdog_interval_seconds=0.05,
-        http_watchdog_timeout_seconds=0.05,
-        http_watchdog_failure_threshold=2,
+        http_ingress_workers=1,
+        http_ingress_queue_size=1,
     )
-    calls = {"count": 0}
-
-    def fake_probe() -> tuple[bool, str]:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return False, "first probe failed"
-        return True, ""
-
+    block_worker = threading.Event()
+    worker_started = threading.Event()
     try:
         manager.server.start()
-        manager.server._probe_http_root = fake_probe
 
-        assert _wait_until(lambda: calls["count"] >= 2)
-        snapshot = manager.server.get_watchdog_snapshot()
-        assert snapshot["failure_count"] == 0
-        assert snapshot["restart_count"] == 0
-        assert snapshot["last_probe_error"] == ""
+        def slow_handle_request(content_type: str, body: bytes, client_ip: str = "unknown") -> None:
+            worker_started.set()
+            block_worker.wait(timeout=3)
+
+        manager.service.handle_request = slow_handle_request
+        port = manager.server._server.server_port
+        assert _post_park(port, b"{}") == 200
+        assert _wait_until(worker_started.is_set)
+        assert _post_park(port, b"{}") == 200
+        assert _post_park(port, b"{}") == 503
+
+        with _open_url(_url(manager.server, "/healthz")) as response:
+            assert response.status == 200
     finally:
+        block_worker.set()
         manager.server.stop()
         manager.service.close()
+
+
+def test_partial_body_disconnect_does_not_break_server(tmp_path: Path) -> None:
+    """客户端上传半个 body 后断开时，server 后续请求仍应正常响应。"""
+    with _bridge_server(tmp_path, request_read_timeout_seconds=0.5) as server:
+        port = server._server.server_port
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /park HTTP/1.1\r\n"
+                b"Host: x\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 5\r\n"
+                b"\r\n"
+                b"12"
+            )
+        finally:
+            sock.close()
+
+        assert _wait_until(lambda: _root_is_healthy(port), timeout=3.0)
 
 
 class _bridge_server:
@@ -400,8 +440,47 @@ def _tcp_port_accepts(port: int) -> bool:
         return False
 
 
+def _raw_http_status(port: int, request_text: str) -> int:
+    """发送原始 HTTP 请求并解析状态码。"""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.sendall(request_text.encode("ascii"))
+        data = sock.recv(256)
+    first_line = data.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    parts = first_line.split()
+    if len(parts) < 2:
+        raise AssertionError(f"invalid HTTP response: {first_line!r}")
+    return int(parts[1])
+
+
+def _post_park(port: int, body: bytes) -> int:
+    """向 /park 发送 JSON 测试请求并返回 HTTP 状态码。"""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        connection.request(
+            "POST",
+            "/park",
+            body=body,
+            headers={"Content-Type": "application/json", "Content-Length": str(len(body))},
+        )
+        response = connection.getresponse()
+        response.read()
+        return int(response.status)
+    finally:
+        connection.close()
+
+
+def _root_is_healthy(port: int) -> bool:
+    """判断根路由是否仍能正常响应。"""
+    try:
+        with _open_url(f"http://127.0.0.1:{port}/") as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
 def _wait_until(predicate, timeout: float = 3.0) -> bool:
-    """等待异步 watchdog 测试条件满足。"""
+    """等待异步 HTTP/worker 测试条件满足。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
