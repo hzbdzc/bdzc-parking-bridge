@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import socket
 import sys
 import threading
@@ -11,15 +12,18 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bdzc_parking.config import AppConfig
+from bdzc_parking.app import setup_logging
 import bdzc_parking.http_server as http_server_module
 from bdzc_parking.http_server import BridgeHTTPServer
 from bdzc_parking.models import SendResult
+from bdzc_parking.safe_logging import configure_emergency_logging, emergency_log_path, log_exception
 from bdzc_parking.service import ParkingBridgeService
 from bdzc_parking.storage import EventStore
 
@@ -182,6 +186,72 @@ def test_status_returns_failure_backlog_and_database_size(tmp_path: Path) -> Non
             assert payload["http_watchdog"]["restart_count"] == 0
 
 
+def test_setup_logging_adds_file_handler_when_root_already_has_handler(tmp_path: Path) -> None:
+    """root 已有 handler 时仍必须补上项目 RotatingFileHandler。"""
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    log_path = tmp_path / "app.log"
+    try:
+        for handler in original_handlers:
+            root.removeHandler(handler)
+        existing_handler = logging.NullHandler()
+        root.addHandler(existing_handler)
+
+        setup_logging(log_path)
+
+        assert any(
+            isinstance(handler, RotatingFileHandler)
+            and Path(handler.baseFilename).resolve() == log_path.resolve()
+            for handler in root.handlers
+        )
+        logging.getLogger("bdzc_parking.tests").info("probe after setup")
+        for handler in root.handlers:
+            if hasattr(handler, "flush"):
+                handler.flush()
+        text = log_path.read_text(encoding="utf-8")
+        assert "logging initialized" in text
+        assert "probe after setup" in text
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+            if handler not in original_handlers:
+                handler.close()
+        for handler in original_handlers:
+            root.addHandler(handler)
+
+
+def test_log_exception_writes_emergency_when_logging_handler_fails(tmp_path: Path) -> None:
+    """普通 logging handler 抛错时，应急日志仍要写入原始异常。"""
+    configure_emergency_logging(tmp_path / "broken.log")
+    logger = logging.getLogger("bdzc_parking.tests.failing")
+    original_handlers = list(logger.handlers)
+    original_propagate = logger.propagate
+
+    class FailingHandler(logging.Handler):
+        """用于模拟普通 logging 输出失败的 handler。"""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """每次 emit 都抛错，模拟文件或控制台 handler 故障。"""
+            raise OSError("forced logging handler failure")
+
+    try:
+        logger.handlers = [FailingHandler()]
+        logger.propagate = False
+        try:
+            raise RuntimeError("original exception for emergency log")
+        except RuntimeError:
+            log_exception(logger, "failed handler path")
+
+        emergency_text = emergency_log_path().read_text(encoding="utf-8")
+        assert "forced logging handler failure" in emergency_text
+        assert "original exception for emergency log" in emergency_text
+    finally:
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers = original_handlers
+        logger.propagate = original_propagate
+
+
 def test_http_server_can_restart_on_same_configured_port(tmp_path: Path) -> None:
     """停止 HTTP server 后，同一个配置端口应能再次启动并响应健康检查。"""
     port = _free_tcp_port()
@@ -202,6 +272,75 @@ def test_http_server_can_restart_on_same_configured_port(tmp_path: Path) -> None
     finally:
         manager.server.stop()
         manager.service.close()
+
+
+def test_process_request_failure_returns_503_and_logs(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """请求线程创建失败时应返回 503、落应急日志，并保持 server 可用。"""
+    configure_emergency_logging(tmp_path / "http.log")
+    caplog.set_level(logging.ERROR, logger="bdzc_parking.http_server")
+    original_process_request = http_server_module.ThreadingHTTPServer.process_request
+    failed_once = False
+
+    def fail_once(self, request, client_address):
+        """第一次模拟线程启动入口失败，之后恢复标准库行为。"""
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("forced process_request failure")
+        return original_process_request(self, request, client_address)
+
+    monkeypatch.setattr(http_server_module.ThreadingHTTPServer, "process_request", fail_once)
+    with _bridge_server(tmp_path) as server:
+        port = server._server.server_port
+        status, body = _raw_http_response(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert status == 503
+        assert body == b"Service Unavailable"
+        assert _wait_until(lambda: _root_is_healthy(port), timeout=3.0)
+
+        with _open_url(_url(server, "/status")) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            assert payload["http_server"]["request_entry_exception_count"] >= 1
+            assert "forced process_request failure" in payload["http_server"]["last_request_entry_exception"]
+
+    emergency_text = emergency_log_path().read_text(encoding="utf-8")
+    assert "forced process_request failure" in emergency_text
+    assert "HTTP process_request failed before request thread" in caplog.text
+
+
+def test_handler_setup_failure_returns_500_and_logs(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """handler 初始化失败时应返回 500、落应急日志，并保持 server 可用。"""
+    configure_emergency_logging(tmp_path / "http.log")
+    caplog.set_level(logging.ERROR, logger="bdzc_parking.http_server")
+    original_setup = http_server_module.HikRequestHandler.setup
+    failed_once = False
+
+    def fail_once(self):
+        """第一次模拟 BaseHTTPRequestHandler setup 失败，之后恢复正常。"""
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise RuntimeError("forced handler setup failure")
+        return original_setup(self)
+
+    monkeypatch.setattr(http_server_module.HikRequestHandler, "setup", fail_once)
+    with _bridge_server(tmp_path) as server:
+        port = server._server.server_port
+        status, body = _raw_http_response(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert status == 500
+        assert body == b"Internal Server Error"
+        assert _wait_until(lambda: _root_is_healthy(port), timeout=3.0)
+
+    emergency_text = emergency_log_path().read_text(encoding="utf-8")
+    assert "forced handler setup failure" in emergency_text
+    assert "HTTP request thread failed before handler completed" in caplog.text
 
 
 def test_http_server_closes_socket_when_thread_exits_without_bridge_stop(tmp_path: Path) -> None:
@@ -451,6 +590,29 @@ def _raw_http_status(port: int, request_text: str) -> int:
     if len(parts) < 2:
         raise AssertionError(f"invalid HTTP response: {first_line!r}")
     return int(parts[1])
+
+
+def _raw_http_response(port: int, request_text: str) -> tuple[int, bytes]:
+    """发送原始 HTTP 请求并返回状态码和响应体。"""
+    chunks: list[bytes] = []
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.settimeout(5)
+        sock.sendall(request_text.encode("ascii"))
+        while True:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            chunks.append(data)
+    response = b"".join(chunks)
+    first_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    parts = first_line.split()
+    if len(parts) < 2:
+        raise AssertionError(f"invalid HTTP response: {first_line!r}")
+    body = response.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in response else b""
+    return int(parts[1]), body
 
 
 def _post_park(port: int, body: bytes) -> int:

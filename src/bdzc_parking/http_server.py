@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ import urllib.request
 from urllib.parse import unquote, urlsplit
 
 from bdzc_parking.config import AppConfig
+from bdzc_parking.safe_logging import log_exception
 from bdzc_parking.service import ParkingBridgeService
 
 
@@ -129,7 +131,7 @@ class BridgeHTTPServer:
             with self._lock:
                 is_active_server = self._server is server
             if is_active_server:
-                LOGGER.exception("HTTP server thread crashed")
+                log_exception(LOGGER, "HTTP server thread crashed")
             else:
                 LOGGER.debug("HTTP server thread exited during server cleanup", exc_info=True)
         else:
@@ -161,7 +163,7 @@ class BridgeHTTPServer:
         try:
             server.server_close()
         except Exception:
-            LOGGER.exception("failed to close stale HTTP server socket after thread exit")
+            log_exception(LOGGER, "failed to close stale HTTP server socket after thread exit")
 
     def _stop_current_server(self) -> None:
         """停止当前 HTTP server 实例，但不处理 watchdog 生命周期。"""
@@ -193,7 +195,7 @@ class BridgeHTTPServer:
                     if shutdown_thread.is_alive():
                         LOGGER.warning("HTTP server shutdown timed out; closing listening socket")
                 except Exception:
-                    LOGGER.exception("failed to request HTTP server shutdown")
+                    log_exception(LOGGER, "failed to request HTTP server shutdown")
             else:
                 LOGGER.warning("HTTP server thread already stopped; closing stale server socket")
 
@@ -205,7 +207,7 @@ class BridgeHTTPServer:
             try:
                 server.server_close()
             except Exception:
-                LOGGER.exception("failed to close HTTP server socket")
+                log_exception(LOGGER, "failed to close HTTP server socket")
         LOGGER.info("HTTP server stopped")
 
     def _cleanup_stopped_server_locked(self) -> None:
@@ -220,7 +222,7 @@ class BridgeHTTPServer:
         try:
             self._server.server_close()
         except Exception:
-            LOGGER.exception("failed to close stale HTTP server socket")
+            log_exception(LOGGER, "failed to close stale HTTP server socket")
         self._server = None
         self._thread = None
 
@@ -258,7 +260,7 @@ class BridgeHTTPServer:
                 self._watchdog_once()
             except Exception as exc:
                 error = f"watchdog error: {type(exc).__name__}: {exc}"
-                LOGGER.exception("HTTP server watchdog loop failed")
+                log_exception(LOGGER, "HTTP server watchdog loop failed")
                 failure_count = self._record_watchdog_failure(error)
                 if failure_count >= self.config.http_watchdog_failure_threshold:
                     self._restart_from_watchdog(error)
@@ -341,7 +343,7 @@ class BridgeHTTPServer:
         try:
             self._stop_current_server()
         except Exception:
-            LOGGER.exception("HTTP server watchdog failed while stopping stale server")
+            log_exception(LOGGER, "HTTP server watchdog failed while stopping stale server")
         try:
             with self._lock:
                 self._start_server_locked()
@@ -352,7 +354,7 @@ class BridgeHTTPServer:
         except Exception as exc:
             with self._lock:
                 self._watchdog_last_probe_error = f"restart failed: {type(exc).__name__}: {exc}"
-            LOGGER.exception("HTTP server watchdog restart failed")
+            log_exception(LOGGER, "HTTP server watchdog restart failed")
         else:
             LOGGER.info("HTTP server watchdog restarted server")
 
@@ -382,6 +384,9 @@ class _ServiceHTTPServer(ThreadingHTTPServer):
         self._connection_stats_lock = threading.Lock()
         self._active_connections = 0
         self._rejected_connections = 0
+        self._request_entry_exception_count = 0
+        self._last_request_entry_exception_at = ""
+        self._last_request_entry_exception = ""
         self.image_rate_limiter = ImageRateLimiter(
             config.image_rate_limit_per_minute,
             config.image_rate_limit_burst,
@@ -399,16 +404,55 @@ class _ServiceHTTPServer(ThreadingHTTPServer):
             self._active_connections += 1
         try:
             super().process_request(request, client_address)
-        except Exception:
+        except Exception as exc:
             self._release_connection_slot()
-            raise
+            self._record_request_entry_exception("process_request", client_address, exc)
+            log_exception(
+                LOGGER,
+                "HTTP process_request failed before request thread client=%s",
+                _client_address_text(client_address),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            self._send_fallback_response(
+                request,
+                client_address,
+                503,
+                "Service Unavailable",
+                "Service Unavailable",
+            )
+            self.close_request(request)
 
     def process_request_thread(self, request, client_address) -> None:
-        """确保每个请求线程结束后归还并发槽位。"""
+        """处理单个请求线程，并兜住 handler 初始化阶段的异常。"""
         try:
-            super().process_request_thread(request, client_address)
+            self.finish_request(request, client_address)
+        except _CLIENT_DISCONNECT_ERRORS as exc:
+            LOGGER.debug(
+                "client disconnected before HTTP handler completed: %s error=%s: %s",
+                _client_address_text(client_address),
+                type(exc).__name__,
+                exc,
+            )
+        except Exception as exc:
+            self._record_request_entry_exception("process_request_thread", client_address, exc)
+            log_exception(
+                LOGGER,
+                "HTTP request thread failed before handler completed client=%s",
+                _client_address_text(client_address),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            self._send_fallback_response(
+                request,
+                client_address,
+                500,
+                "Internal Server Error",
+                "Internal Server Error",
+            )
         finally:
-            self._release_connection_slot()
+            try:
+                self.shutdown_request(request)
+            finally:
+                self._release_connection_slot()
 
     def _release_connection_slot(self) -> None:
         """归还一个 HTTP 连接并发槽位，并维护运行计数。"""
@@ -421,16 +465,70 @@ class _ServiceHTTPServer(ThreadingHTTPServer):
         with self._connection_stats_lock:
             active_connections = self._active_connections
             rejected_connections = self._rejected_connections
+            exception_count = self._request_entry_exception_count
+            last_exception_at = self._last_request_entry_exception_at
+            last_exception = self._last_request_entry_exception
         return {
             "max_connections": self.max_connections,
             "active_connections": active_connections,
             "rejected_connections": rejected_connections,
             "request_queue_size": self.request_queue_size,
+            "request_entry_exception_count": exception_count,
+            "last_request_entry_exception_at": last_exception_at,
+            "last_request_entry_exception": last_exception,
         }
 
     def handle_error(self, request, client_address) -> None:
         """记录 handler 线程未捕获异常，避免静默吞掉请求级错误。"""
-        LOGGER.exception("uncaught HTTP handler error from %s", _client_address_text(client_address))
+        exc_type, exc, traceback_obj = sys.exc_info()
+        if exc_type is not None and exc is not None:
+            self._record_request_entry_exception("handle_error", client_address, exc)
+        log_exception(
+            LOGGER,
+            "uncaught HTTP handler error from %s",
+            _client_address_text(client_address),
+            exc_info=(exc_type, exc, traceback_obj) if exc_type is not None and exc is not None else None,
+        )
+
+    def _record_request_entry_exception(self, context: str, client_address, exc: BaseException) -> None:
+        """记录 HTTP 请求入口异常的计数和最近一次摘要，供 /status 排查。"""
+        summary = f"{context} client={_client_address_text(client_address)} {type(exc).__name__}: {exc}"
+        with self._connection_stats_lock:
+            self._request_entry_exception_count += 1
+            self._last_request_entry_exception_at = datetime.now().isoformat(timespec="seconds")
+            self._last_request_entry_exception = summary[:1000]
+
+    def _send_fallback_response(
+        self,
+        request,
+        client_address,
+        status_code: int,
+        reason: str,
+        body_text: str,
+    ) -> None:
+        """在 handler 尚未可用时直接向 socket 写入最小 HTTP 错误响应。"""
+        body = body_text.encode("utf-8")
+        response = (
+            f"HTTP/1.1 {status_code} {reason}\r\n"
+            "Connection: close\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "\r\n"
+        ).encode("ascii") + body
+        try:
+            request.settimeout(1.0)
+            request.sendall(response)
+            self._drain_rejected_request(request)
+        except _CLIENT_DISCONNECT_ERRORS:
+            LOGGER.debug("client disconnected before fallback response: %s", _client_address_text(client_address))
+        except OSError as exc:
+            self._record_request_entry_exception("fallback_response", client_address, exc)
+            log_exception(
+                LOGGER,
+                "failed to send fallback HTTP response to %s",
+                _client_address_text(client_address),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     def _send_busy_response(self, request, client_address) -> None:
         """并发过高时直接返回 503，保护业务处理线程池。"""
@@ -522,7 +620,8 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             )
             self.close_connection = True
         except Exception:
-            LOGGER.exception(
+            log_exception(
+                LOGGER,
                 "HTTP handler failed request_id=%s client=%s method=%s path=%s",
                 self.request_id,
                 self._client_ip(),
@@ -611,7 +710,8 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             self._send_text(408, "Request Timeout")
             self.close_connection = True
         except Exception:
-            LOGGER.exception(
+            log_exception(
+                LOGGER,
                 "HTTP request handling failed request_id=%s client=%s method=%s path=%s",
                 self.request_id,
                 self._client_ip(),
@@ -704,7 +804,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         try:
             data = image_path.read_bytes()
         except OSError:
-            LOGGER.exception("failed to read image file: %s", image_path)
+            log_exception(LOGGER, "failed to read image file: %s", image_path)
             self._send_text(404, "Not Found")
             return
 
@@ -716,7 +816,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         try:
             db_ok = self.server.service.is_database_healthy()
         except Exception:
-            LOGGER.exception("health check failed")
+            log_exception(LOGGER, "health check failed")
             db_ok = False
         payload = {
             "status": "ok" if db_ok else "error",
@@ -733,7 +833,7 @@ class HikRequestHandler(BaseHTTPRequestHandler):
             payload["http_watchdog"] = self.server.bridge_server.get_watchdog_snapshot()
             payload["http_server"] = self.server.get_runtime_snapshot()
         except Exception:
-            LOGGER.exception("status endpoint failed")
+            log_exception(LOGGER, "status endpoint failed")
             self._send_json(
                 500,
                 {
@@ -830,6 +930,15 @@ class HikRequestHandler(BaseHTTPRequestHandler):
         """返回当前请求客户端 IP。"""
         return self.client_address[0] if self.client_address else "unknown"
 
+    def log_error(self, fmt: str, *args: object) -> None:
+        """把 BaseHTTPRequestHandler 的协议错误按 warning 写入生产日志。"""
+        LOGGER.warning(
+            "HTTP protocol error request_id=%s client=%s message=%s",
+            getattr(self, "request_id", "-"),
+            self._client_ip(),
+            _format_log_message(fmt, args),
+        )
+
     def log_message(self, fmt: str, *args: object) -> None:
         """把 BaseHTTPRequestHandler 的访问日志接入项目 logger。"""
         LOGGER.debug(fmt, *args)
@@ -915,3 +1024,13 @@ def _client_address_text(client_address: object) -> str:
         port = client_address[1] if len(client_address) > 1 else ""
         return f"{host}:{port}" if port != "" else host
     return str(client_address or "unknown")
+
+
+def _format_log_message(fmt: str, args: tuple[object, ...]) -> str:
+    """按 logging 百分号格式尽力生成可读消息。"""
+    if not args:
+        return fmt
+    try:
+        return fmt % args
+    except Exception:
+        return f"{fmt} args={args!r}"
