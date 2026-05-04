@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from bdzc_parking.common import json_loads_or_text, pretty_json_text
 from bdzc_parking.config import AppConfig
 from bdzc_parking.http_server import BridgeHTTPServer
 from bdzc_parking.models import HikEvent, SendResult, map_to_partner_payload
@@ -70,20 +71,8 @@ CONFIG_FIELD_GROUPS = [
     (
         "桥接与发送",
         (
-            "retry_count",
-            "retry_delay_seconds",
             "request_timeout_seconds",
             "max_event_age_seconds",
-            "request_read_timeout_seconds",
-            "http_max_connections",
-            "http_request_queue_size",
-            "http_ingress_queue_size",
-            "http_ingress_workers",
-            "http_watchdog_interval_seconds",
-            "http_watchdog_timeout_seconds",
-            "http_watchdog_failure_threshold",
-            "http_watchdog_restart_cooldown_seconds",
-            "event_page_size",
         ),
     ),
 ]
@@ -104,20 +93,8 @@ CONFIG_FIELD_LABELS = {
     "local_entry_cid": "博达入口 CID",
     "local_entry_cname": "博达入口名称",
     "default_phone": "默认手机号",
-    "retry_count": "重试次数",
-    "retry_delay_seconds": "重试间隔秒",
     "request_timeout_seconds": "请求超时秒",
     "max_event_age_seconds": "过旧跳过秒数",
-    "request_read_timeout_seconds": "HTTP 读取超时秒",
-    "http_max_connections": "HTTP 最大连接数",
-    "http_request_queue_size": "HTTP 监听队列长度",
-    "http_ingress_queue_size": "HTTP 接收队列长度",
-    "http_ingress_workers": "HTTP 接收 worker 数",
-    "http_watchdog_interval_seconds": "HTTP 守护探测间隔秒",
-    "http_watchdog_timeout_seconds": "HTTP 守护探测超时秒",
-    "http_watchdog_failure_threshold": "HTTP 守护失败次数",
-    "http_watchdog_restart_cooldown_seconds": "HTTP 守护重启冷却秒",
-    "event_page_size": "每页记录数",
     "db_path": "数据库路径",
     "log_path": "日志路径",
 }
@@ -137,20 +114,8 @@ CONFIG_FIELD_TOOLTIPS = {
     "local_entry_cid": "博达入口通道 CID；车辆出上园路、进入博达园区时，发送 hobby=out。",
     "local_entry_cname": "博达入口通道名称；车辆出上园路、进入博达园区时，发送 hobby=out。",
     "default_phone": "大园区 payload 中默认填充的手机号，模拟发送也会默认使用这个值。",
-    "retry_count": "首次发送失败后额外重试的次数，0 表示只发 1 次。",
-    "retry_delay_seconds": "每次重试之间等待的秒数。",
     "request_timeout_seconds": "向大园区 API 发起 HTTP 请求时的超时秒数，必须大于 0。",
     "max_event_age_seconds": "过车时间相对收到时间超过这个秒数时，自动跳过发送，但仍会保留记录。",
-    "request_read_timeout_seconds": "读取海康 HTTP 请求头和请求体的 socket 超时秒数，必须大于 0。",
-    "http_max_connections": "HTTP server 同时处理的连接上限；修改后需要重启 HTTP server 生效。",
-    "http_request_queue_size": "操作系统监听 backlog 上限；修改后需要重启 HTTP server 生效。",
-    "http_ingress_queue_size": "已接收但尚未进入业务解析的 /park 内存队列长度；修改后需要重启程序生效。",
-    "http_ingress_workers": "消费 HTTP 接收队列的后台 worker 数；修改后需要重启程序生效。",
-    "http_watchdog_interval_seconds": "HTTP server 运行时，每隔多少秒从本机探测一次 GET /。",
-    "http_watchdog_timeout_seconds": "HTTP server 健康探测的单次超时秒数，必须大于 0。",
-    "http_watchdog_failure_threshold": "连续多少次健康探测失败后，自动重启 HTTP server。",
-    "http_watchdog_restart_cooldown_seconds": "自动重启失败或刚重启后，至少等待多少秒才允许再次重启。",
-    "event_page_size": "主列表每页显示的记录数；默认 1000，翻页可查看更旧记录。",
     "db_path": "SQLite 数据库文件路径；可通过配置文件修改，变更后需要重启程序生效。",
     "log_path": "程序日志文件路径；可通过配置文件修改，变更后需要重启程序生效。",
 }
@@ -192,6 +157,8 @@ EVENT_TABLE_FILTER_KEYS = [
 ]
 FILTER_ALL_TEXT = "全部"
 FILTER_OPTION_LIMIT = 500
+EVENT_PAGE_SIZE = 1000
+DEFAULT_EVENT_TABLE_WIDTHS = [70, 170, 110, 90, 120, 90, 110, 260]
 
 
 class BridgeSignals(QObject):
@@ -487,7 +454,7 @@ class ConfigDialog(QDialog):
 
     def _collect_config_form(self) -> dict[str, object]:
         """从输入框收集配置，并转换为正确的字段类型。"""
-        values: dict[str, object] = {"listen_host": "0.0.0.0"}
+        values: dict[str, object] = {}
         for key, field in self.config_fields.items():
             if isinstance(field, QCheckBox):
                 values[key] = field.isChecked()
@@ -500,26 +467,9 @@ class ConfigDialog(QDialog):
                     continue
                 raise ValueError(f"{key} 不能为空")
             try:
-                if key in {
-                    "listen_port",
-                    "retry_count",
-                    "http_max_connections",
-                    "http_request_queue_size",
-                    "http_ingress_queue_size",
-                    "http_ingress_workers",
-                    "http_watchdog_failure_threshold",
-                    "event_page_size",
-                }:
+                if key == "listen_port":
                     values[key] = int(text)
-                elif key in {
-                    "retry_delay_seconds",
-                    "request_timeout_seconds",
-                    "max_event_age_seconds",
-                    "request_read_timeout_seconds",
-                    "http_watchdog_interval_seconds",
-                    "http_watchdog_timeout_seconds",
-                    "http_watchdog_restart_cooldown_seconds",
-                }:
+                elif key in {"request_timeout_seconds", "max_event_age_seconds"}:
                     values[key] = float(text)
                 else:
                     values[key] = text
@@ -537,18 +487,8 @@ class ConfigDialog(QDialog):
         notices = [headline]
         if imported_path is not None:
             notices.append("已导入外部配置；普通“保存配置”仍会写回当前活动配置文件。")
-        if self.http_server.is_running and (
-            previous.listen_host != self.http_server.config.listen_host
-            or previous.listen_port != self.http_server.config.listen_port
-            or previous.http_max_connections != self.http_server.config.http_max_connections
-            or previous.http_request_queue_size != self.http_server.config.http_request_queue_size
-        ):
+        if self.http_server.is_running and previous.listen_port != self.http_server.config.listen_port:
             notices.append("HTTP 监听参数变更需要停止并重新开始 HTTP server 后生效。")
-        if (
-            previous.http_ingress_queue_size != self.http_server.config.http_ingress_queue_size
-            or previous.http_ingress_workers != self.http_server.config.http_ingress_workers
-        ):
-            notices.append("HTTP 接收队列或 worker 数变更需要重启程序后生效。")
         if previous.listen_path != self.http_server.config.listen_path:
             notices.append("接收路径变更会立即影响后续进入程序的 HTTP 请求。")
         if previous.external_url_base != self.http_server.config.external_url_base:
@@ -624,8 +564,8 @@ class EventDetailDialog(QDialog):
 
         detail = {
             "record": record,
-            "partner_payload": _load_json(str(self.row.get("partner_payload_json") or "{}")),
-            "hikvision_event": _load_json(str(self.row.get("raw_json") or "{}")),
+            "partner_payload": json_loads_or_text(str(self.row.get("partner_payload_json") or "{}")),
+            "hikvision_event": json_loads_or_text(str(self.row.get("raw_json") or "{}")),
         }
         self.detail.setPlainText(json.dumps(detail, ensure_ascii=False, indent=2))
 
@@ -967,8 +907,14 @@ class MockSendDialog(QDialog):
         form.addRow("车牌号", self.plate_field)
 
         self.direction_field = QComboBox()
-        self.direction_field.addItem("我方入口进场 -> 大园区 out", "enter")
-        self.direction_field.addItem("我方出口出场 -> 大园区 in", "exit")
+        self.direction_field.addItem(
+            f"我方入口进场 -> 大园区 {self.service.config.local_entry_hobby}",
+            "enter",
+        )
+        self.direction_field.addItem(
+            f"我方出口出场 -> 大园区 {self.service.config.local_exit_hobby}",
+            "exit",
+        )
         form.addRow("过车方向", self.direction_field)
 
         self.event_time_field = QDateTimeEdit(QDateTime.currentDateTime())
@@ -1082,7 +1028,7 @@ class MockSendDialog(QDialog):
             "success": result.success,
             "attempts": result.attempts,
             "status_code": result.status_code,
-            "response_text": _load_json(result.response_text) if result.response_text else "",
+            "response_text": json_loads_or_text(result.response_text) if result.response_text else "",
             "error": result.error,
         }
         self.result_text.setPlainText(json.dumps(detail, ensure_ascii=False, indent=2))
@@ -1137,10 +1083,6 @@ class MainWindow(QMainWindow):
         self.filter_controls: dict[str, QWidget] = {}
         self._updating_filter_controls = False
         self.signals = BridgeSignals()
-        self.column_width_save_timer = QTimer(self)
-        self.column_width_save_timer.setSingleShot(True)
-        self.column_width_save_timer.setInterval(500)
-        self.column_width_save_timer.timeout.connect(self._save_table_column_widths)
         self.plate_filter_timer = QTimer(self)
         self.plate_filter_timer.setSingleShot(True)
         self.plate_filter_timer.setInterval(300)
@@ -1161,7 +1103,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(1000)
-        self.refresh_timer.timeout.connect(self.refresh_table)
+        self.refresh_timer.timeout.connect(self._refresh_periodic)
         self.refresh_timer.start()
         self.refresh_table()
 
@@ -1331,7 +1273,7 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self.show_selected_detail)
-        self._restore_table_column_widths()
+        self._set_default_table_column_widths()
         header.sectionResized.connect(self._handle_table_column_resized)
         self.filter_scroll = self._build_filter_row()
         self.table.horizontalScrollBar().valueChanged.connect(
@@ -1474,7 +1416,6 @@ class MainWindow(QMainWindow):
         """点击配置按钮后打开配置编辑弹窗。"""
         dialog = ConfigDialog(self.http_server, self.backup_and_start_new_database, self)
         dialog.exec()
-        self._restore_table_column_widths()
         self.refresh_table()
         self._update_buttons()
 
@@ -1509,7 +1450,7 @@ class MainWindow(QMainWindow):
         if was_running:
             try:
                 self.http_server.start()
-            except OSError as exc:
+            except Exception as exc:
                 QMessageBox.warning(self, "HTTP server 未恢复", str(exc))
             self._update_buttons()
         self.refresh_timer.start()
@@ -1561,8 +1502,8 @@ class MainWindow(QMainWindow):
 
             try:
                 self.http_server.start()
-            except OSError as exc:
-                address = f"{self.http_server.config.listen_host}:{self.http_server.config.listen_port}"
+            except Exception as exc:
+                address = f"0.0.0.0:{self.http_server.config.listen_port}"
                 QMessageBox.critical(self, "启动失败", f"无法启动 HTTP server：{address}\n\n{exc}")
         finally:
             self.server_button.setEnabled(True)
@@ -1582,23 +1523,18 @@ class MainWindow(QMainWindow):
 
     def go_last_page(self) -> None:
         """跳转到最旧记录所在的最后一页。"""
-        self._set_page(_page_count(self.total_event_count, self._event_page_size()) - 1)
+        self._set_page(_page_count(self.total_event_count, EVENT_PAGE_SIZE) - 1)
 
     def _set_page(self, page_index: int) -> None:
         """设置当前页并刷新表格，页码使用从 0 开始的内部索引。"""
-        max_page_index = max(0, _page_count(self.total_event_count, self._event_page_size()) - 1)
+        max_page_index = max(0, _page_count(self.total_event_count, EVENT_PAGE_SIZE) - 1)
         self.current_page_index = min(max(0, page_index), max_page_index)
         self.last_selected_event_id = None
         self.refresh_table()
 
-    def _event_page_size(self) -> int:
-        """读取配置中的分页大小，并兜底为 1000。"""
-        return max(1, int(getattr(self.http_server.config, "event_page_size", 1000) or 1000))
-
     def _update_pagination_controls(self) -> None:
         """根据当前页和总数更新翻页按钮状态与页码说明。"""
-        page_size = self._event_page_size()
-        page_count = _page_count(self.total_event_count, page_size)
+        page_count = _page_count(self.total_event_count, EVENT_PAGE_SIZE)
         current_page = min(self.current_page_index + 1, page_count)
         has_previous = self.current_page_index > 0
         has_next = self.current_page_index < page_count - 1
@@ -1608,7 +1544,7 @@ class MainWindow(QMainWindow):
         self.next_page_button.setEnabled(has_next)
         self.last_page_button.setEnabled(has_next)
         self.page_info_label.setText(
-            f"第 {current_page} / {page_count} 页，共 {self.total_event_count} 条，每页 {page_size} 条"
+            f"第 {current_page} / {page_count} 页，共 {self.total_event_count} 条，每页 {EVENT_PAGE_SIZE} 条"
         )
 
     def refresh_table(self) -> None:
@@ -1619,13 +1555,12 @@ class MainWindow(QMainWindow):
             or self.detail_panel.current_event_id
         )
         previous_detail_id = self.detail_panel.current_event_id
-        page_size = self._event_page_size()
         self.total_event_count = self.store.count_events(self.event_filters)
-        max_page_index = max(0, _page_count(self.total_event_count, page_size) - 1)
+        max_page_index = max(0, _page_count(self.total_event_count, EVENT_PAGE_SIZE) - 1)
         if self.current_page_index > max_page_index:
             self.current_page_index = max_page_index
-        offset = self.current_page_index * page_size
-        rows = self.store.list_events(limit=page_size, offset=offset, filters=self.event_filters)
+        offset = self.current_page_index * EVENT_PAGE_SIZE
+        rows = self.store.list_events(limit=EVENT_PAGE_SIZE, offset=offset, filters=self.event_filters)
         self._refresh_filter_options()
         selected_after_refresh: int | None = None
         scroll_state = self._capture_table_scroll_state()
@@ -1674,6 +1609,11 @@ class MainWindow(QMainWindow):
             self.last_selected_event_id = selected_after_refresh
             self.show_selected_detail()
         self._update_pagination_controls()
+
+    def _refresh_periodic(self) -> None:
+        """定时刷新列表和 HTTP server 生命周期显示。"""
+        self.refresh_table()
+        self._update_buttons()
 
     def show_selected_detail(self, _item: QTableWidgetItem | None = None) -> None:
         """左侧列表选择变化后，在右侧常驻面板显示完整详情。"""
@@ -1769,13 +1709,9 @@ class MainWindow(QMainWindow):
         self.table.horizontalScrollBar().setValue(horizontal_value)
         self.table.verticalScrollBar().setValue(vertical_value)
 
-    def _restore_table_column_widths(self) -> None:
-        """按配置恢复过车列表列宽，未配置时使用一组易读默认宽度。"""
-        widths = self.http_server.config.event_table_column_widths
-        if len(widths) != self.table.columnCount():
-            widths = [70, 170, 110, 90, 120, 90, 110, 260]
-
-        for column_index, width in enumerate(widths):
+    def _set_default_table_column_widths(self) -> None:
+        """使用固定默认宽度初始化过车列表列宽。"""
+        for column_index, width in enumerate(DEFAULT_EVENT_TABLE_WIDTHS):
             self.table.setColumnWidth(column_index, max(48, int(width)))
 
     def _remember_sort(self, column: int, order: Qt.SortOrder) -> None:
@@ -1784,28 +1720,44 @@ class MainWindow(QMainWindow):
         self.sort_order = order
 
     def _handle_table_column_resized(self, _logical_index: int, _old_size: int, _new_size: int) -> None:
-        """表格列宽变化时同步筛选控件宽度并延迟保存配置。"""
+        """表格列宽变化时同步筛选控件宽度。"""
         self._sync_filter_widths()
-        self._schedule_save_table_column_widths()
-
-    def _schedule_save_table_column_widths(self) -> None:
-        """用户拖动列宽后延迟保存，避免拖动过程中频繁写配置文件。"""
-        self.column_width_save_timer.start()
-
-    def _save_table_column_widths(self) -> None:
-        """把当前过车列表列宽保存到配置文件，供下次启动恢复。"""
-        widths = [self.table.columnWidth(index) for index in range(self.table.columnCount())]
-        self.http_server.config.event_table_column_widths = widths
-        self.http_server.config.save()
 
     def _update_buttons(self) -> None:
         """根据 HTTP server 状态更新按钮文案和状态灯。"""
-        running = self.http_server.is_running
+        snapshot = self.http_server.get_lifecycle_snapshot()
+        state = str(snapshot.get("state") or "stopped")
+        running = state in {"starting", "running"}
+        label, color = _http_server_state_display(state)
+        failure_reason = str(snapshot.get("last_failure_reason") or "")
+        failure_at = str(snapshot.get("last_failed_at") or "")
+
         self.server_button.setText("停止 HTTP server" if running else "开始 HTTP server")
+        self.server_button.setEnabled(state not in {"starting", "stopping"})
         self.status_dot.setStyleSheet(
-            f"border: 1px solid #7a7a7a; border-radius: 7px; background: {'#2da44e' if running else '#cf222e'};"
+            f"border: 1px solid #7a7a7a; border-radius: 7px; background: {color};"
         )
-        self.status_label.setText("运行中" if running else "未运行")
+        if state == "failed" and failure_reason:
+            self.status_label.setText(f"{label}: {failure_reason}")
+        else:
+            self.status_label.setText(label)
+        tooltip = ""
+        if failure_reason:
+            tooltip = f"{failure_at}\n{failure_reason}".strip()
+        self.status_label.setToolTip(tooltip)
+
+
+def _http_server_state_display(state: str) -> tuple[str, str]:
+    """把 HTTP server 生命周期状态转换为 GUI 文案和状态灯颜色。"""
+    if state == "starting":
+        return "启动中", "#bf8700"
+    if state == "running":
+        return "运行中", "#2da44e"
+    if state == "stopping":
+        return "停止中", "#bf8700"
+    if state == "failed":
+        return "故障", "#cf222e"
+    return "未运行", "#8c959f"
 
 
 def _has_partner_payload(row: dict[str, object]) -> bool:
@@ -1882,14 +1834,6 @@ def _default_help_markdown() -> str:
 
 陈哲达
 """
-
-
-def _load_json(text: str) -> object:
-    """尽量把数据库中的 JSON 文本还原成对象，失败时保留原文。"""
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return text
 
 
 def _readonly_text_edit(placeholder: str) -> QTextEdit:
@@ -2008,7 +1952,7 @@ def _api_return_info(row: dict[str, object]) -> str:
         parts.append(f"HTTP {http_status}")
 
     response_text = str(row.get("response_text") or "")
-    response = _load_json(response_text) if response_text else {}
+    response = json_loads_or_text(response_text) if response_text else {}
     if isinstance(response, dict):
         partner_status = response.get("status")
         partner_msg = response.get("msg")
@@ -2027,7 +1971,7 @@ def _api_return_info(row: dict[str, object]) -> str:
 
 def _format_received_message(row: dict[str, object]) -> str:
     """格式化右侧详情中的接收 HTTP JSON 部分，不显示 multipart 二进制内容。"""
-    return _pretty_json_text(str(row.get("raw_json") or "{}"))
+    return pretty_json_text(str(row.get("raw_json") or "{}"))
 
 
 def _format_partner_request_message(row: dict[str, object], config: AppConfig) -> str:
@@ -2036,7 +1980,7 @@ def _format_partner_request_message(row: dict[str, object], config: AppConfig) -
     if last_request_payload_text not in {"", "{}"}:
         request_url = str(row.get("last_request_url") or config.partner_api_url)
         title = "实际发送 API"
-        body = _pretty_json_text(last_request_payload_text)
+        body = pretty_json_text(last_request_payload_text)
     else:
         try:
             payload = load_partner_payload(row, config)
@@ -2056,14 +2000,6 @@ def _format_partner_request_message(row: dict[str, object], config: AppConfig) -
             body,
         ]
     )
-
-
-def _pretty_json_text(text: str) -> str:
-    """如果文本是 JSON 就格式化显示，否则原样显示。"""
-    value = _load_json(text)
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, indent=2)
 
 
 def _default_event_time() -> str:

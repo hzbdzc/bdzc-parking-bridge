@@ -1,19 +1,15 @@
-"""大园区 API 客户端发送与重试逻辑测试。"""
+"""大园区 API 客户端发送逻辑测试。"""
 
 from __future__ import annotations
 
 import json
-import sys
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-# 测试直接运行源码目录，避免未安装包时找不到 bdzc_parking。
-sys.path.insert(0, str(ROOT / "src"))
 
 from bdzc_parking.config import AppConfig
 from bdzc_parking.sender import PartnerClient
+from helpers import free_tcp_port
 
 
 class FakePartnerHandler(BaseHTTPRequestHandler):
@@ -48,8 +44,8 @@ class FakePartnerHandler(BaseHTTPRequestHandler):
 def test_sender_posts_text_json_and_interprets_success() -> None:
     """客户端应以 text/json POST，并识别大园区成功响应。"""
     with _fake_server(fail_until=0) as url:
-        client = PartnerClient(AppConfig(partner_api_url=url, retry_count=3, retry_delay_seconds=0))
-        result = client.send_with_retry({"car": "浙A0C547"})
+        client = PartnerClient(AppConfig(partner_api_url=url))
+        result = client.send_once({"car": "浙A0C547"})
 
     assert result.success is True
     assert result.attempts == 1
@@ -57,16 +53,38 @@ def test_sender_posts_text_json_and_interprets_success() -> None:
     assert json.loads(FakePartnerHandler.request_bodies[0].decode("utf-8"))["car"] == "浙A0C547"
 
 
-def test_sender_retries_three_times_after_initial_failure() -> None:
-    """客户端应在初次失败后按配置继续重试。"""
+def test_sender_interprets_partner_failure_without_retrying() -> None:
+    """客户端只发送一次，业务重试由 service 持久化状态机调度。"""
     with _fake_server(fail_until=99) as url:
-        client = PartnerClient(AppConfig(partner_api_url=url, retry_count=3, retry_delay_seconds=0))
-        result = client.send_with_retry({"car": "浙A0C547"})
+        client = PartnerClient(AppConfig(partner_api_url=url))
+        result = client.send_once({"car": "浙A0C547"})
 
     assert result.success is False
-    assert result.attempts == 4
-    assert FakePartnerHandler.calls == 4
+    assert result.attempts == 1
+    assert FakePartnerHandler.calls == 1
     assert result.error == "temporary"
+
+
+def test_sender_url_error_logs_debug_not_warning(caplog) -> None:
+    """底层 urllib 连接错误只作为 DEBUG 细节记录，业务结果由 service 汇总。"""
+    port = free_tcp_port()
+    caplog.set_level(logging.DEBUG, logger="bdzc_parking.sender")
+    client = PartnerClient(
+        AppConfig(
+            partner_api_url=f"http://127.0.0.1:{port}/api",
+            request_timeout_seconds=0.2,
+        )
+    )
+
+    result = client.send_once({"car": "浙A0C547"})
+
+    assert result.success is False
+    sender_records = [record for record in caplog.records if record.name == "bdzc_parking.sender"]
+    assert any(
+        record.levelno == logging.DEBUG and "partner API URL error" in record.getMessage()
+        for record in sender_records
+    )
+    assert not any(record.levelno >= logging.WARNING for record in sender_records)
 
 
 class _fake_server:

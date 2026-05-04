@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import urllib.error
 import urllib.request
 
@@ -20,21 +19,6 @@ class PartnerClient:
     def __init__(self, config: AppConfig):
         """保存 API 地址、超时和重试等发送配置。"""
         self.config = config
-
-    def send_with_retry(self, payload: dict[str, object]) -> SendResult:
-        """按配置重试发送请求，返回最后一次发送结果。"""
-        max_attempts = self.config.retry_count + 1
-        last_result = SendResult(success=False, attempts=0, error="not attempted")
-
-        # 总尝试次数 = 首次发送 + retry_count 次重试。
-        for attempt in range(1, max_attempts + 1):
-            last_result = self.send_once(payload, attempt)
-            if last_result.success:
-                return last_result
-            if attempt < max_attempts:
-                time.sleep(self.config.retry_delay_seconds)
-
-        return last_result
 
     def send_once(self, payload: dict[str, object], attempt: int = 1) -> SendResult:
         """向大园区 API 发起一次 HTTP POST。"""
@@ -54,13 +38,13 @@ class PartnerClient:
                 return _interpret_response(attempt, response.status, response_body)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            LOGGER.warning("partner API HTTP error: %s %s", exc.code, body)
+            LOGGER.debug("partner API HTTP error: %s %s", exc.code, body)
             return SendResult(False, attempt, exc.code, body, f"HTTP {exc.code}")
         except urllib.error.URLError as exc:
-            LOGGER.warning("partner API URL error: %s", exc)
+            LOGGER.debug("partner API URL error: %s", exc)
             return SendResult(False, attempt, error=str(exc.reason))
         except OSError as exc:
-            LOGGER.warning("partner API send failed: %s", exc)
+            LOGGER.debug("partner API send failed: %s", exc)
             return SendResult(False, attempt, error=str(exc))
 
 

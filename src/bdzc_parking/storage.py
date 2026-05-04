@@ -7,12 +7,23 @@ import logging
 import re
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Any
 
+from bdzc_parking.common import (
+    ascii_filename_part,
+    file_size_or_zero,
+    image_suffix_from_parts,
+    is_supported_image_part,
+    iso_days_ago,
+    iso_now,
+    iso_seconds_ago,
+    timestamp_for_filename,
+    unique_path,
+)
 from bdzc_parking.config import AppConfig
 from bdzc_parking.models import HikEvent, SendResult
 
@@ -28,52 +39,6 @@ EVENT_FILTER_COLUMNS = {
     "status": "status",
 }
 EVENT_DATE_EXPRESSION = "substr(COALESCE(NULLIF(event_time, ''), received_at), 1, 10)"
-_FILENAME_TOKEN_MAP = {
-    "京": "JING",
-    "津": "JIN",
-    "沪": "HU",
-    "渝": "YU",
-    "冀": "JI",
-    "晋": "JIN",
-    "蒙": "MENG",
-    "辽": "LIAO",
-    "吉": "JI",
-    "黑": "HEI",
-    "苏": "SU",
-    "浙": "ZHE",
-    "皖": "WAN",
-    "闽": "MIN",
-    "赣": "GAN",
-    "鲁": "LU",
-    "豫": "YU",
-    "鄂": "E",
-    "湘": "XIANG",
-    "粤": "YUE",
-    "桂": "GUI",
-    "琼": "QIONG",
-    "川": "CHUAN",
-    "蜀": "SHU",
-    "贵": "GUI",
-    "云": "YUN",
-    "滇": "DIAN",
-    "藏": "ZANG",
-    "陕": "SHAAN",
-    "秦": "QIN",
-    "甘": "GAN",
-    "青": "QING",
-    "宁": "NING",
-    "新": "XIN",
-    "港": "HK",
-    "澳": "MO",
-    "学": "XUE",
-    "警": "JING",
-    "领": "LING",
-    "使": "SHI",
-    "挂": "GUA",
-    "临": "LIN",
-    "试": "SHI",
-    "超": "CHAO",
-}
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -164,7 +129,7 @@ class EventStore:
             if existing is not None:
                 return int(existing["id"]), False
 
-            now = received_at or _now()
+            now = received_at or iso_now()
             image_path = self._save_event_image(event)
             received_body_path = self._save_request_body(
                 event.event_key,
@@ -219,7 +184,7 @@ class EventStore:
             if existing is not None:
                 return int(existing["id"])
 
-            now = _now()
+            now = iso_now()
             received_body_path = self._save_request_body(event_key, content_type, body, now)
             cursor = conn.execute(
                 """
@@ -244,7 +209,7 @@ class EventStore:
 
     def claim_ready_event(self, event_id: int) -> dict[str, Any] | None:
         """原子地把待发送或到期待重试记录抢占为 sending，并返回最新记录。"""
-        now = _now()
+        now = iso_now()
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -286,7 +251,7 @@ class EventStore:
                     last_request_payload_json = ?
                 WHERE id = ?
                 """,
-                (_now(), payload_json, request_url, payload_json, event_id),
+                (iso_now(), payload_json, request_url, payload_json, event_id),
             )
 
     def update_send_result(
@@ -296,7 +261,7 @@ class EventStore:
         next_retry_at: str | None = None,
     ) -> None:
         """根据本次发送结果把记录写成 sent、failed_retryable 或 dead_letter。"""
-        now = _now()
+        now = iso_now()
         status = "sent" if result.success else ("failed_retryable" if next_retry_at else "dead_letter")
         dead_lettered_at = now if status == "dead_letter" else ""
         with self._lock, self._connect() as conn:
@@ -418,7 +383,7 @@ class EventStore:
 
     def list_ready_event_ids(self, limit: int = 300) -> list[int]:
         """返回当前可发送记录 ID，包括 pending 和到期待重试记录。"""
-        now = _now()
+        now = iso_now()
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
@@ -443,8 +408,8 @@ class EventStore:
 
     def recover_stale_sending(self, stale_seconds: float) -> int:
         """把长时间停留在 sending 的记录改为 failed_retryable 并立即允许重试。"""
-        cutoff = _time_seconds_ago(stale_seconds)
-        now = _now()
+        cutoff = iso_seconds_ago(stale_seconds)
+        now = iso_now()
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -474,13 +439,13 @@ class EventStore:
                     last_error = ''
                 WHERE id = ? AND partner_payload_json NOT IN ('', '{}')
                 """,
-                (_now(), event_id),
+                (iso_now(), event_id),
             )
             return cursor.rowcount > 0
 
     def mark_dead_letter(self, event_id: int, error: str) -> None:
         """把内部无法继续处理的记录写成 dead_letter，避免卡在 sending。"""
-        now = _now()
+        now = iso_now()
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -496,9 +461,9 @@ class EventStore:
             )
 
     def probe_database_health(self) -> bool:
-        """执行轻量 SQLite 读写探针，供 /healthz 判断数据库是否可用。"""
+        """执行轻量 SQLite 读写探针，供 /status 判断数据库是否可用。"""
         if not self._lock.acquire(timeout=SQLITE_HEALTH_TIMEOUT_SECONDS):
-            LOGGER.warning("database health probe timed out waiting for store lock")
+            LOGGER.debug("database health probe timed out waiting for store lock")
             return False
         try:
             conn = sqlite3.connect(
@@ -518,7 +483,7 @@ class EventStore:
             finally:
                 conn.close()
         except sqlite3.Error:
-            LOGGER.exception("database health probe failed")
+            LOGGER.debug("database health probe failed", exc_info=True)
             return False
         finally:
             self._lock.release()
@@ -564,8 +529,8 @@ class EventStore:
         artifact_retention_days: int,
     ) -> dict[str, int]:
         """按保留期清理过期事件、附件和孤儿文件。"""
-        event_cutoff = _time_days_ago(event_retention_days)
-        artifact_cutoff = _time_days_ago(artifact_retention_days)
+        event_cutoff = iso_days_ago(event_retention_days)
+        artifact_cutoff = iso_days_ago(artifact_retention_days)
 
         with self._lock, self._connect() as conn:
             expired_rows = conn.execute(
@@ -619,7 +584,7 @@ class EventStore:
                         image_data = NULL, received_body_path = '', partner_payload_json = ?
                     WHERE id = ?
                     """,
-                    (_now(), _remove_payload_image_reference(row["partner_payload_json"]), event_id),
+                    (iso_now(), _remove_payload_image_reference(row["partner_payload_json"]), event_id),
                 )
 
             referenced_rows = conn.execute(
@@ -684,7 +649,7 @@ class EventStore:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE events SET status = ?, updated_at = ? WHERE id = ?",
-                (status, _now(), event_id),
+                (status, iso_now(), event_id),
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -757,7 +722,7 @@ class EventStore:
 
     def _migrate_legacy_failed_statuses(self, conn: sqlite3.Connection) -> None:
         """把旧版本遗留的 failed 状态统一升级为 dead_letter。"""
-        now = _now()
+        now = iso_now()
         conn.execute(
             """
             UPDATE events
@@ -779,7 +744,7 @@ class EventStore:
             return ""
         target_dir = self._event_image_dir(event.event_time)
         target_dir.mkdir(parents=True, exist_ok=True)
-        image_path = _unique_path(
+        image_path = unique_path(
             target_dir / f"{_event_image_filename(event)}{_image_suffix(event)}"
         )
         image_path.write_bytes(event.image.data)
@@ -794,7 +759,7 @@ class EventStore:
         target_dir = self._request_artifact_dir(time_text)
         target_dir.mkdir(parents=True, exist_ok=True)
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", event_key).strip("._") or "event"
-        request_path = target_dir / f"{_timestamp_for_filename()}_{safe_key[:80]}.bin"
+        request_path = target_dir / f"{timestamp_for_filename()}_{safe_key[:80]}.bin"
         request_path.write_bytes(_prepare_request_body_for_storage(content_type, body))
         return request_path.as_posix()
 
@@ -804,10 +769,7 @@ class EventStore:
         if not image_path:
             return row
 
-        try:
-            row["image_size"] = Path(image_path).stat().st_size
-        except OSError:
-            row["image_size"] = 0
+        row["image_size"] = file_size_or_zero(Path(image_path))
         return row
 
     def _migrate_existing_images(self, conn: sqlite3.Connection) -> None:
@@ -825,8 +787,8 @@ class EventStore:
             target_dir = self._event_image_dir(str(row["event_time"] or ""))
             target_dir.mkdir(parents=True, exist_ok=True)
             image_path = target_dir / (
-                f"legacy_{row['id']}_{_ascii_filename_part(row['event_key'])[:80]}"
-                f"{_image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
+                f"legacy_{row['id']}_{ascii_filename_part(row['event_key'])[:80]}"
+                f"{image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
             )
             image_path.write_bytes(row["image_data"])
             conn.execute(
@@ -852,12 +814,12 @@ class EventStore:
             target_dir.mkdir(parents=True, exist_ok=True)
             target_name = (
                 f"{_event_image_filename_from_parts(row['plate_no'], row['direction'], row['event_time'])}"
-                f"{_image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
+                f"{image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
             )
             target_path = current_path
             desired_path = target_dir / target_name
             if current_path != desired_path:
-                target_path = _unique_path(desired_path)
+                target_path = unique_path(desired_path)
                 try:
                     current_path.rename(target_path)
                 except OSError:
@@ -969,7 +931,7 @@ class EventStore:
 
                 target_dir = self.request_dir / matched.group("date")
                 target_dir.mkdir(parents=True, exist_ok=True)
-                target_path = _unique_path(target_dir / file_path.name)
+                target_path = unique_path(target_dir / file_path.name)
                 try:
                     file_path.rename(target_path)
                 except OSError as exc:
@@ -998,16 +960,16 @@ class EventStore:
                 SET received_body_path = ?, updated_at = ?
                 WHERE received_body_path = ?
                 """,
-                (new_text, _now(), old_text),
+                (new_text, iso_now(), old_text),
             )
             updated_rows += max(0, int(cursor.rowcount))
         return updated_rows
 
     def _database_size_bytes(self) -> dict[str, int]:
         """统计 SQLite 主库及 WAL/SHM 文件大小。"""
-        db_main = _file_size(self.db_path)
-        db_wal = _file_size(self.db_path.with_name(f"{self.db_path.name}-wal"))
-        db_shm = _file_size(self.db_path.with_name(f"{self.db_path.name}-shm"))
+        db_main = file_size_or_zero(self.db_path)
+        db_wal = file_size_or_zero(self.db_path.with_name(f"{self.db_path.name}-wal"))
+        db_shm = file_size_or_zero(self.db_path.with_name(f"{self.db_path.name}-shm"))
         return {
             "db_main_size_bytes": db_main,
             "db_wal_size_bytes": db_wal,
@@ -1052,21 +1014,6 @@ def load_partner_payload(
     if not isinstance(value, dict):
         raise ValueError("partner_payload_json is not an object")
     return _payload_with_image_reference(value, str(row.get("image_path") or ""), config)
-
-
-def _now() -> str:
-    """返回秒级 ISO8601 本地时间字符串。"""
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def _time_seconds_ago(seconds: float) -> str:
-    """返回若干秒前的本地时间字符串。"""
-    return (datetime.now() - timedelta(seconds=seconds)).isoformat(timespec="seconds")
-
-
-def _time_days_ago(days: int) -> str:
-    """返回若干天前的本地时间字符串。"""
-    return (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
 
 
 def _event_filter_where_clause(
@@ -1256,14 +1203,6 @@ def _delete_files(paths: set[str]) -> int:
     return deleted
 
 
-def _file_size(path: Path) -> int:
-    """返回文件大小；文件不存在或无法读取时返回 0。"""
-    try:
-        return path.stat().st_size
-    except OSError:
-        return 0
-
-
 def _database_runtime_files(db_path: Path) -> tuple[Path, Path, Path]:
     """返回 SQLite 主库和 WAL/SHM 辅助文件路径。"""
     return (
@@ -1278,7 +1217,7 @@ def _next_database_backup_path(db_path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = db_path.suffix or ".sqlite3"
     backup_dir = db_path.parent / "backups"
-    return _unique_path(backup_dir / f"{db_path.stem}_backup_{timestamp}{suffix}")
+    return unique_path(backup_dir / f"{db_path.stem}_backup_{timestamp}{suffix}")
 
 
 def _path_rewrite_pairs(old_path: Path, new_path: Path) -> list[tuple[str, str]]:
@@ -1313,17 +1252,12 @@ def _path_text_variants(path: Path) -> list[str]:
     return variants
 
 
-def _timestamp_for_filename() -> str:
-    """返回适合用于文件名的本地时间戳。"""
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-
 def _image_suffix(event: HikEvent) -> str:
     """根据图片 MIME 类型或原始文件名选择落地扩展名。"""
     if event.image is None:
         return ".jpg"
 
-    return _image_suffix_from_parts(event.image.content_type, event.image.name)
+    return image_suffix_from_parts(event.image.content_type, event.image.name)
 
 
 def _event_date_for_directory(value: str) -> str:
@@ -1331,7 +1265,7 @@ def _event_date_for_directory(value: str) -> str:
     try:
         return datetime.fromisoformat(value).strftime("%Y%m%d")
     except ValueError:
-        fallback = _ascii_filename_part(value)[:32]
+        fallback = ascii_filename_part(value)[:32]
         return fallback or "unknown-date"
 
 
@@ -1368,7 +1302,7 @@ def _redact_multipart_body(content_type: str, body: bytes) -> bytes:
             chunks.append(f"{key}: {value}".encode("utf-8"))
         chunks.append(b"")
         payload = part.get_payload(decode=True) or b""
-        if _is_image_part_for_storage(part.get_filename(), part.get_content_type(), payload):
+        if is_supported_image_part(part.get_filename(), part.get_content_type(), payload):
             placeholder = (
                 "[image binary omitted]"
                 f" filename={part.get_filename() or '-'}"
@@ -1383,17 +1317,6 @@ def _redact_multipart_body(content_type: str, body: bytes) -> bytes:
     return b"\r\n".join(chunks)
 
 
-def _is_image_part_for_storage(name: str | None, content_type: str, payload: bytes) -> bool:
-    """判断 multipart part 是否为图片，从而在 raw_requests 中做二进制脱敏。"""
-    if not payload:
-        return False
-    normalized_type = (content_type or "").lower()
-    normalized_name = (name or "").strip().lower()
-    if normalized_type.startswith("image/"):
-        return True
-    return normalized_name.endswith((".jpg", ".jpeg", ".png"))
-
-
 def _event_image_filename(event: HikEvent) -> str:
     """生成包含车牌、方向和时间戳的过车图片文件名主体。"""
     return _event_image_filename_from_parts(event.plate_no, event.direction, event.event_time)
@@ -1401,7 +1324,7 @@ def _event_image_filename(event: HikEvent) -> str:
 
 def _event_image_filename_from_parts(plate_no: str, direction: str, event_time: str) -> str:
     """用数据库字段生成图片文件名主体。"""
-    plate = _ascii_filename_part(plate_no) or "unknown_plate"
+    plate = ascii_filename_part(plate_no) or "unknown_plate"
     direction_text = _direction_for_filename(direction)
     timestamp = _event_time_for_filename(event_time)
     return f"{plate}_{direction_text}_{timestamp}"
@@ -1413,7 +1336,7 @@ def _direction_for_filename(direction: str) -> str:
         return "enter"
     if direction == "exit":
         return "exit"
-    return _ascii_filename_part(direction) or "unknown_direction"
+    return ascii_filename_part(direction) or "unknown_direction"
 
 
 def _event_time_for_filename(value: str) -> str:
@@ -1421,58 +1344,4 @@ def _event_time_for_filename(value: str) -> str:
     try:
         return datetime.fromisoformat(value).strftime("%Y%m%d_%H%M%S")
     except ValueError:
-        return _ascii_filename_part(value)[:40] or _timestamp_for_filename()
-
-
-def _safe_filename_part(value: object) -> str:
-    """清理 Windows 文件名非法字符，并保留车牌中的中文。"""
-    text = str(value or "").strip()
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
-    text = re.sub(r"\s+", "_", text)
-    return text.strip(" ._")
-
-
-def _ascii_filename_part(value: object) -> str:
-    """把任意文本转换成稳定的 ASCII 文件名片段，避免 URL 中出现中文转义。"""
-    text = _safe_filename_part(value)
-    if not text:
-        return ""
-
-    pieces: list[str] = []
-    for char in text:
-        if re.fullmatch(r"[A-Za-z0-9._-]", char):
-            pieces.append(char)
-        elif char in _FILENAME_TOKEN_MAP:
-            pieces.append(_FILENAME_TOKEN_MAP[char])
-        else:
-            pieces.append(f"u{ord(char):x}")
-    normalized = "".join(pieces)
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized)
-    normalized = re.sub(r"_+", "_", normalized)
-    return normalized.strip("._-")
-
-
-def _unique_path(path: Path) -> Path:
-    """如果目标文件已存在，自动追加序号避免覆盖。"""
-    if not path.exists():
-        return path
-
-    for index in range(2, 10_000):
-        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-    return path.with_name(f"{path.stem}_{_timestamp_for_filename()}{path.suffix}")
-
-
-def _image_suffix_from_parts(content_type: str, image_name: str) -> str:
-    """根据图片 MIME 类型和文件名推断图片扩展名。"""
-    content_type = content_type.lower()
-    if "png" in content_type:
-        return ".png"
-    if "jpeg" in content_type or "jpg" in content_type:
-        return ".jpg"
-
-    suffix = Path(image_name).suffix.lower()
-    if suffix in {".jpg", ".jpeg", ".png"}:
-        return suffix
-    return ".jpg"
+        return ascii_filename_part(value)[:40] or timestamp_for_filename()

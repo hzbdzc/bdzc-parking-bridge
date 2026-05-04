@@ -3,26 +3,19 @@
 from __future__ import annotations
 
 import json
-import sys
-import time
+import logging
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-SAMPLES = ROOT / "references" / "hik_events"
-sys.path.insert(0, str(ROOT / "src"))
-
 import bdzc_parking.service as service_module
 from bdzc_parking.config import AppConfig
 from bdzc_parking.models import SendResult
 from bdzc_parking.service import ParkingBridgeService
 from bdzc_parking.storage import EventStore
-
-
-CONTENT_TYPE = "multipart/form-data; boundary=---------------------------7e13971310878"
+from helpers import HIKVISION_CONTENT_TYPE, sample_body, wait_until
 
 
 class FakeClient:
@@ -73,16 +66,15 @@ def test_skipped_stale_record_with_valid_plate_still_generates_partner_payload(t
         local_exit_cname="北门出口",
         local_entry_cid="ENTRY-001",
         local_entry_cname="南门入口",
-        sender_worker_count=1,
         max_event_age_seconds=0.0,
     )
     store = EventStore(tmp_path / "events.sqlite3")
     client = FakeClient(config)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
 
         rows = store.list_events()
         assert len(rows) == 1
@@ -105,17 +97,18 @@ def test_skipped_stale_record_with_valid_plate_still_generates_partner_payload(t
         service.close()
 
 
-def test_stop_record_is_auto_sent(tmp_path: Path) -> None:
+def test_stop_record_is_auto_sent(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """停车触发 stop 记录也应进入自动发送流程。"""
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0)
+    caplog.set_level(logging.INFO, logger="bdzc_parking.service")
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = CapturingClient(config)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_071503_319787_body.bin").read_bytes()
+    body = sample_body("20260412_071503_319787_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
-        assert _wait_until(lambda: client.calls == 1)
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(lambda: client.calls == 1)
 
         row = store.list_events()[0]
         assert row["status"] == "sent"
@@ -123,6 +116,12 @@ def test_stop_record_is_auto_sent(tmp_path: Path) -> None:
         assert row["skip_reason"] == ""
         assert row["passing_type"] == "stop"
         assert client.payloads[0]["car"] == row["plate_no"]
+        assert f"event_id={row['id']}" in caplog.text
+        assert f"plate={row['plate_no']}" in caplog.text
+        assert "Hik event stored" in caplog.text
+        assert "partner send result" in caplog.text
+        assert "success=yes" in caplog.text
+        assert "final_status=sent" in caplog.text
     finally:
         service.close()
 
@@ -135,15 +134,15 @@ def test_manual_record_is_auto_sent(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         return replace(original_extract_event(raw), passing_type="manual")
 
     monkeypatch.setattr(service_module, "extract_event", extract_manual_event)
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0)
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = CapturingClient(config)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
-        assert _wait_until(lambda: client.calls == 1)
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(lambda: client.calls == 1)
 
         row = store.list_events()[0]
         assert row["status"] == "sent"
@@ -157,20 +156,20 @@ def test_manual_record_is_auto_sent(monkeypatch: pytest.MonkeyPatch, tmp_path: P
 
 def test_send_record_uses_latest_external_url_base(tmp_path: Path) -> None:
     """手动重发前修改 external_url_base 时，应按新值生成图片 URL。"""
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=0.0)
+    config = AppConfig(max_event_age_seconds=0.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = CapturingClient(config)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
         row = store.list_events()[0]
         event_id = int(row["id"])
 
         config.external_url_base = "https://public.example.com/parking-images"
         service.manual_resend(event_id)
-        assert _wait_until(lambda: client.calls == 1)
+        assert wait_until(lambda: client.calls == 1)
 
         assert client.calls == 1
         assert client.payloads[0]["img"].startswith("https://public.example.com/parking-images/")
@@ -187,15 +186,15 @@ def test_failed_event_sets_next_retry_after_first_failure(monkeypatch: pytest.Mo
     monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (10.0, 20.0, 30.0))
     monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
 
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0)
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = FlakyClient(config, fail_until=1)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
-        assert _wait_until(
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(
             lambda: bool(store.list_events())
             and store.list_events()[0]["status"] == "failed_retryable"
             and store.list_events()[0]["attempts"] == 1
@@ -220,15 +219,15 @@ def test_failed_event_retries_then_becomes_dead_letter(
     monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
     monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
 
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0)
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = FlakyClient(config, fail_until=99)
     service = ParkingBridgeService(config, store, client)
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     try:
-        service.handle_request(CONTENT_TYPE, body)
-        assert _wait_until(
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(
             lambda: bool(store.list_events()) and store.list_events()[0]["status"] == "dead_letter",
             timeout_seconds=2.0,
         )
@@ -249,16 +248,17 @@ def test_stale_sending_record_is_recovered_and_sent_again(
     """启动时卡在 sending 的旧记录应恢复为可重试并再次发送。"""
     monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
     monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(service_module, "_STALE_SENDING_SECONDS", 0.0)
 
-    config = AppConfig(sender_worker_count=1, max_event_age_seconds=10_000_000_000.0, stale_sending_seconds=0.0)
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
+    body = sample_body("20260412_063354_226439_body.bin")
 
     bootstrap_client = CapturingClient(config)
     bootstrap_service = ParkingBridgeService(config, store, bootstrap_client)
     try:
-        bootstrap_service.handle_request(CONTENT_TYPE, body)
-        assert _wait_until(lambda: bool(store.list_events()) and store.list_events()[0]["status"] == "sent")
+        bootstrap_service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(lambda: bool(store.list_events()) and store.list_events()[0]["status"] == "sent")
     finally:
         bootstrap_service.close()
 
@@ -276,20 +276,10 @@ def test_stale_sending_record_is_recovered_and_sent_again(
     recovery_client = CapturingClient(config)
     recovery_service = ParkingBridgeService(config, store, recovery_client)
     try:
-        assert _wait_until(lambda: recovery_client.calls == 1)
+        assert wait_until(lambda: recovery_client.calls == 1)
         recovered = store.get_event(int(row["id"]))
         assert recovered is not None
         assert recovered["status"] == "sent"
         assert recovered["attempts"] == 2
     finally:
         recovery_service.close()
-
-
-def _wait_until(predicate, timeout_seconds: float = 2.0) -> bool:
-    """在有限时间内轮询条件，供后台发送测试等待状态收敛。"""
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return predicate()

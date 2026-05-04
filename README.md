@@ -4,7 +4,7 @@
 
 ## 功能简介
 
-- 内置 HTTP server，接收海康停车终端上报的过车消息。
+- 内置 Uvicorn/Starlette HTTP server，接收海康停车终端上报的过车消息。
 - 解析海康 multipart/JSON 报文，提取过车字段和图片。
 - 按规则过滤自动发送事件，支持车牌识别、停车触发和手动放行三类有效事件，跳过无车牌、无效事件类型、过车时间过旧等不需要自动发送的记录。
 - 对于车牌有效且方向可映射的记录，预生成大园区 API payload；即使默认跳过自动发送，仍可在详情里手动发送。
@@ -13,7 +13,8 @@
 - 支持配置 `external_url_base`，把 `img` 拼成外部可访问的图片 URL，并由内置 HTTP server 提供图片下载。
 - 图片下载按 IP 做令牌桶限流，避免外部反复刷图拖垮程序。
 - 发送链路使用固定后台 worker 和有界队列，避免下游 API 异常时线程数无限增长。
-- 提供最小运维接口：`GET /healthz` 返回进程和 SQLite 健康状态，`GET /status` 返回失败堆积、队列长度、最近成功发送时间和数据库大小。
+- 提供最小运维接口：`GET /status` 返回健康状态、失败堆积、队列、数据库大小和 HTTP server 生命周期状态。
+- HTTP server 不做 watchdog 自动重启；非主动停止的线程退出会记录为故障，并在 GUI 状态栏和 `/status` 中显示。
 - SQLite 启用 WAL / busy timeout，并按保留期清理过期事件、图片和原始报文。
 - 使用 Qt GUI 控制 HTTP server、分页查看过车列表和详情、载入/导出配置、查看日志、执行模拟发送测试。
 
@@ -52,8 +53,7 @@ GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会
 ## 运维接口
 
 - `GET /`：纯文本存活响应，保持兼容旧探针和人工检查方式。
-- `GET /healthz`：JSON 健康检查；只按进程可响应且 SQLite 可用返回成功。
-- `GET /status`：JSON 状态接口；返回失败堆积数、队列长度、最近一次成功发送时间和数据库大小。
+- `GET /status`：JSON 状态接口；返回进程和 SQLite 健康状态、失败堆积数、队列长度、最近一次成功发送时间、数据库大小和 `http_server.lifecycle`。
 
 ## 配置说明
 
@@ -65,19 +65,14 @@ GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会
 - `local_entry_hobby`、`local_entry_cid`、`local_entry_cname`：博达入口通道；车辆出上园路、进入博达园区时默认发送 `hobby: "out"`
 - `default_phone`、`external_url_base`
 - `request_timeout_seconds`、`max_event_age_seconds`
-- `max_request_bytes`、`request_read_timeout_seconds`
-- `sender_worker_count`、`sender_queue_size`、`stale_sending_seconds`
-- `event_retention_days`、`artifact_retention_days`
-- `image_rate_limit_per_minute`、`image_rate_limit_burst`
-- `db_path`、`log_path`、`event_page_size`、`event_table_column_widths`
+- `db_path`、`log_path`
 
 其中：
 
 - `external_url_base` 为空时，`img` 保持图片文件名；非空时会变成完整 URL，例如 `https://host/parking-images/<文件名>`。
 - `external_url_base` 必须带明确 path 前缀，程序会把这个 path 前缀作为图片下载路由，例如 `https://host/parking-images` 对应 `/parking-images/<文件名>`。
 - 自动发送重试策略固定为 `1s / 5s / 10s`，不再由配置文件控制。
-- `image_rate_limit_per_minute` 和 `image_rate_limit_burst` 只作用于图片 GET，不影响海康 `POST/PUT` 上报。
-- `event_page_size` 控制 GUI 主列表每页记录数，默认 `1000`；可通过首页、上一页、下一页、末页查看旧记录。
+- HTTP 容量、请求大小、图片限流、后台 worker、清理保留期和 GUI 分页大小使用代码内固定默认值，避免现场配置过多影响稳定性。
 
 GUI 配置窗口支持直接编辑当前活动配置、载入外部配置文件并立即应用、把当前配置导出到指定文件。鼠标悬浮每个配置项时会显示用途和生效说明。
 
@@ -128,9 +123,10 @@ uv run python -m compileall -q src tests
 | [src/bdzc_parking/__init__.py](src/bdzc_parking/__init__.py) | 包版本和导出信息 |
 | [src/bdzc_parking/__main__.py](src/bdzc_parking/__main__.py) | `python -m bdzc_parking` 的模块入口 |
 | [src/bdzc_parking/app.py](src/bdzc_parking/app.py) | 组装配置、日志配置、数据库、发送客户端、业务服务、HTTP server 和 GUI |
+| [src/bdzc_parking/common.py](src/bdzc_parking/common.py) | 跨模块共享的纯工具函数，包含时间、JSON 展示、文件名、路径和图片 part 判断等无业务状态操作 |
 | [src/bdzc_parking/config.py](src/bdzc_parking/config.py) | 应用配置默认值、JSON 配置文件读取、字段类型转换和保存 |
 | [src/bdzc_parking/gui.py](src/bdzc_parking/gui.py) | PySide6 GUI，负责 HTTP server 控制、过车列表、右侧详情面板、配置弹窗、模拟发送测试和手动发送 |
-| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 海康消息接收 HTTP server、`/healthz` / `/status` 运维接口、图片访问路由和请求限流 |
+| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 基于 Uvicorn/Starlette 的海康消息接收 HTTP server、`/status` 运维接口、图片访问路由、请求限流和生命周期状态 |
 | [src/bdzc_parking/models.py](src/bdzc_parking/models.py) | `HikEvent`、`HikEventImage`、`SendResult` 等跨模块数据模型，以及事件过滤和海康到大园区 payload 的方向反转映射 |
 | [src/bdzc_parking/maintenance.py](src/bdzc_parking/maintenance.py) | 一次性维护命令入口，负责执行历史 `raw_requests` 文件按日期整理等工具动作 |
 | [src/bdzc_parking/parser.py](src/bdzc_parking/parser.py) | 海康 multipart/JSON 解析、过车字段提取和图片 part 提取 |
@@ -143,7 +139,7 @@ uv run python -m compileall -q src tests
 | 文件 | 说明 |
 | --- | --- |
 | [tests/test_config.py](tests/test_config.py) | 配置文件加载、导入导出、URL 校验和字段类型转换测试 |
-| [tests/test_http_server.py](tests/test_http_server.py) | 图片下载路由、限流、请求体大小保护和 `/healthz`、`/status` 接口测试 |
+| [tests/test_http_server.py](tests/test_http_server.py) | 图片下载路由、限流、请求体大小保护、生命周期状态和 `/status` 接口测试 |
 | [tests/test_maintenance.py](tests/test_maintenance.py) | 维护命令入口和历史 `raw_requests` 文件整理输出测试 |
 | [tests/test_mapper.py](tests/test_mapper.py) | 过车事件过滤和方向反转映射测试 |
 | [tests/test_parser.py](tests/test_parser.py) | 海康消息样本解析、关键字段提取和图片提取测试 |

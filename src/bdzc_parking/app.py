@@ -9,13 +9,6 @@ from pathlib import Path
 
 from bdzc_parking.config import AppConfig
 from bdzc_parking.http_server import BridgeHTTPServer
-from bdzc_parking.safe_logging import (
-    configure_emergency_logging,
-    emergency_log_path,
-    ensure_emergency_handler,
-    install_global_exception_hooks,
-    log_exception,
-)
 from bdzc_parking.sender import PartnerClient
 from bdzc_parking.service import ParkingBridgeService
 from bdzc_parking.storage import EventStore
@@ -24,16 +17,13 @@ from bdzc_parking.storage import EventStore
 def setup_logging(log_path: Path) -> None:
     """配置根 logger，并把日志同时写入文件和控制台。"""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    configure_emergency_logging(log_path)
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    ensure_emergency_handler(root)
-
     resolved_log_path = log_path.resolve()
     has_file_handler = any(
         isinstance(handler, RotatingFileHandler)
@@ -47,22 +37,32 @@ def setup_logging(log_path: Path) -> None:
             backupCount=5,
             encoding="utf-8",
         )
-        file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
+    for handler in root.handlers:
+        if (
+            isinstance(handler, RotatingFileHandler)
+            and Path(handler.baseFilename).resolve() == resolved_log_path
+        ):
+            handler.setLevel(logging.DEBUG)
+            handler.setFormatter(formatter)
 
     has_console_handler = any(
         type(handler) is logging.StreamHandler for handler in root.handlers
     )
     if not has_console_handler:
         console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
         root.addHandler(console_handler)
+    for handler in root.handlers:
+        if type(handler) is logging.StreamHandler:
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(formatter)
 
-    install_global_exception_hooks()
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     logging.getLogger(__name__).info(
-        "logging initialized path=%s emergency_log_path=%s",
+        "logging initialized path=%s",
         log_path,
-        emergency_log_path(),
     )
 
 
@@ -79,8 +79,8 @@ def main() -> int:
     if config.auto_start_server:
         try:
             http_server.start()
-        except OSError:
-            log_exception(logging.getLogger(__name__), "failed to auto-start HTTP server")
+        except Exception:
+            logging.getLogger(__name__).exception("failed to auto-start HTTP server")
 
     try:
         from bdzc_parking.gui import run_gui

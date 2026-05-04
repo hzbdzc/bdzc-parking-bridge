@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -13,7 +13,6 @@ from urllib.parse import quote, urlparse
 DEFAULT_CONFIG_PATH = Path("config.json")
 CONFIG_PATH_ENV = "HKPARKING_CONFIG"
 CONFIG_VALUE_KEYS = {
-    "listen_host",
     "listen_port",
     "listen_path",
     "auto_start_server",
@@ -27,31 +26,10 @@ CONFIG_VALUE_KEYS = {
     "local_entry_cname",
     "default_phone",
     "external_url_base",
-    "retry_count",
-    "retry_delay_seconds",
     "request_timeout_seconds",
     "max_event_age_seconds",
-    "max_request_bytes",
-    "request_read_timeout_seconds",
-    "http_max_connections",
-    "http_request_queue_size",
-    "http_ingress_queue_size",
-    "http_ingress_workers",
-    "http_watchdog_interval_seconds",
-    "http_watchdog_timeout_seconds",
-    "http_watchdog_failure_threshold",
-    "http_watchdog_restart_cooldown_seconds",
-    "sender_worker_count",
-    "sender_queue_size",
-    "stale_sending_seconds",
-    "event_retention_days",
-    "artifact_retention_days",
-    "image_rate_limit_per_minute",
-    "image_rate_limit_burst",
-    "event_page_size",
     "db_path",
     "log_path",
-    "event_table_column_widths",
 }
 
 
@@ -59,7 +37,6 @@ CONFIG_VALUE_KEYS = {
 class AppConfig:
     """桥接程序的运行配置。"""
 
-    listen_host: str = "0.0.0.0"
     listen_port: int = 1888
     listen_path: str = "/park"
     auto_start_server: bool = False
@@ -73,31 +50,10 @@ class AppConfig:
     local_entry_cname: str = "博达入口"
     default_phone: str = "13800000000"
     external_url_base: str = ""
-    retry_count: int = 3
-    retry_delay_seconds: float = 1.0
     request_timeout_seconds: float = 5.0
     max_event_age_seconds: float = 60.0
-    max_request_bytes: int = 1_048_576
-    request_read_timeout_seconds: float = 15.0
-    http_max_connections: int = 64
-    http_request_queue_size: int = 128
-    http_ingress_queue_size: int = 256
-    http_ingress_workers: int = 1
-    http_watchdog_interval_seconds: float = 10.0
-    http_watchdog_timeout_seconds: float = 3.0
-    http_watchdog_failure_threshold: int = 2
-    http_watchdog_restart_cooldown_seconds: float = 30.0
-    sender_worker_count: int = 4
-    sender_queue_size: int = 1000
-    stale_sending_seconds: float = 300.0
-    event_retention_days: int = 180
-    artifact_retention_days: int = 30
-    image_rate_limit_per_minute: int = 60
-    image_rate_limit_burst: int = 20
-    event_page_size: int = 1000
     db_path: Path = Path("data/bdzc_parking.sqlite3")
     log_path: Path = Path("logs/bdzc_parking.log")
-    event_table_column_widths: list[int] = field(default_factory=list)
     config_path: Path = DEFAULT_CONFIG_PATH
 
     @classmethod
@@ -142,7 +98,6 @@ class AppConfig:
     def to_dict(self) -> dict[str, object]:
         """转换为可写入 JSON 配置文件的字典。"""
         return {
-            "listen_host": self.listen_host,
             "listen_port": self.listen_port,
             "listen_path": self.listen_path,
             "auto_start_server": self.auto_start_server,
@@ -156,31 +111,10 @@ class AppConfig:
             "local_entry_cname": self.local_entry_cname,
             "default_phone": self.default_phone,
             "external_url_base": self.external_url_base_normalized,
-            "retry_count": self.retry_count,
-            "retry_delay_seconds": self.retry_delay_seconds,
             "request_timeout_seconds": self.request_timeout_seconds,
             "max_event_age_seconds": self.max_event_age_seconds,
-            "max_request_bytes": self.max_request_bytes,
-            "request_read_timeout_seconds": self.request_read_timeout_seconds,
-            "http_max_connections": self.http_max_connections,
-            "http_request_queue_size": self.http_request_queue_size,
-            "http_ingress_queue_size": self.http_ingress_queue_size,
-            "http_ingress_workers": self.http_ingress_workers,
-            "http_watchdog_interval_seconds": self.http_watchdog_interval_seconds,
-            "http_watchdog_timeout_seconds": self.http_watchdog_timeout_seconds,
-            "http_watchdog_failure_threshold": self.http_watchdog_failure_threshold,
-            "http_watchdog_restart_cooldown_seconds": self.http_watchdog_restart_cooldown_seconds,
-            "sender_worker_count": self.sender_worker_count,
-            "sender_queue_size": self.sender_queue_size,
-            "stale_sending_seconds": self.stale_sending_seconds,
-            "event_retention_days": self.event_retention_days,
-            "artifact_retention_days": self.artifact_retention_days,
-            "image_rate_limit_per_minute": self.image_rate_limit_per_minute,
-            "image_rate_limit_burst": self.image_rate_limit_burst,
-            "event_page_size": self.event_page_size,
             "db_path": _path_to_config_text(self.db_path),
             "log_path": _path_to_config_text(self.log_path),
-            "event_table_column_widths": self.event_table_column_widths,
         }
 
     @property
@@ -206,7 +140,6 @@ class AppConfig:
     def validate(self) -> None:
         """校验配置值是否满足运行约束。"""
         for key in {
-            "listen_host",
             "listen_path",
             "partner_api_url",
             "park_id",
@@ -229,50 +162,10 @@ class AppConfig:
             raise ValueError("listen_port 必须在 1 到 65535 之间")
         if not self.listen_path.startswith("/"):
             raise ValueError("listen_path 必须以 / 开头")
-        if self.retry_count < 0:
-            raise ValueError("retry_count 不能小于 0")
-        if self.retry_delay_seconds < 0:
-            raise ValueError("retry_delay_seconds 不能小于 0")
         if self.request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds 必须大于 0")
         if self.max_event_age_seconds < 0:
             raise ValueError("max_event_age_seconds 不能小于 0")
-        if self.max_request_bytes <= 0:
-            raise ValueError("max_request_bytes 必须大于 0")
-        if self.request_read_timeout_seconds <= 0:
-            raise ValueError("request_read_timeout_seconds 必须大于 0")
-        if self.http_max_connections <= 0:
-            raise ValueError("http_max_connections 必须大于 0")
-        if self.http_request_queue_size <= 0:
-            raise ValueError("http_request_queue_size 必须大于 0")
-        if self.http_ingress_queue_size <= 0:
-            raise ValueError("http_ingress_queue_size 必须大于 0")
-        if self.http_ingress_workers <= 0:
-            raise ValueError("http_ingress_workers 必须大于 0")
-        if self.http_watchdog_interval_seconds <= 0:
-            raise ValueError("http_watchdog_interval_seconds 必须大于 0")
-        if self.http_watchdog_timeout_seconds <= 0:
-            raise ValueError("http_watchdog_timeout_seconds 必须大于 0")
-        if self.http_watchdog_failure_threshold <= 0:
-            raise ValueError("http_watchdog_failure_threshold 必须大于 0")
-        if self.http_watchdog_restart_cooldown_seconds <= 0:
-            raise ValueError("http_watchdog_restart_cooldown_seconds 必须大于 0")
-        if self.sender_worker_count <= 0:
-            raise ValueError("sender_worker_count 必须大于 0")
-        if self.sender_queue_size <= 0:
-            raise ValueError("sender_queue_size 必须大于 0")
-        if self.stale_sending_seconds <= 0:
-            raise ValueError("stale_sending_seconds 必须大于 0")
-        if self.event_retention_days <= 0:
-            raise ValueError("event_retention_days 必须大于 0")
-        if self.artifact_retention_days <= 0:
-            raise ValueError("artifact_retention_days 必须大于 0")
-        if self.image_rate_limit_per_minute <= 0:
-            raise ValueError("image_rate_limit_per_minute 必须大于 0")
-        if self.image_rate_limit_burst <= 0:
-            raise ValueError("image_rate_limit_burst 必须大于 0")
-        if self.event_page_size <= 0:
-            raise ValueError("event_page_size 必须大于 0")
         if self.external_url_base.strip():
             _validate_external_url_base(self.external_url_base)
 
@@ -312,34 +205,9 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 def _coerce_value(key: str, value: Any) -> object:
     """把 JSON 值转换为 AppConfig 字段需要的类型。"""
-    if key in {
-        "listen_port",
-        "retry_count",
-        "http_watchdog_failure_threshold",
-        "max_request_bytes",
-        "http_max_connections",
-        "http_request_queue_size",
-        "http_ingress_queue_size",
-        "http_ingress_workers",
-        "sender_worker_count",
-        "sender_queue_size",
-        "event_retention_days",
-        "artifact_retention_days",
-        "image_rate_limit_per_minute",
-        "image_rate_limit_burst",
-        "event_page_size",
-    }:
+    if key == "listen_port":
         return int(value)
-    if key in {
-        "retry_delay_seconds",
-        "request_timeout_seconds",
-        "max_event_age_seconds",
-        "request_read_timeout_seconds",
-        "http_watchdog_interval_seconds",
-        "http_watchdog_timeout_seconds",
-        "http_watchdog_restart_cooldown_seconds",
-        "stale_sending_seconds",
-    }:
+    if key in {"request_timeout_seconds", "max_event_age_seconds"}:
         return float(value)
     if key == "auto_start_server":
         return _coerce_bool(value)
@@ -347,8 +215,6 @@ def _coerce_value(key: str, value: Any) -> object:
         return str(value).strip().lower()
     if key in {"db_path", "log_path"}:
         return Path(str(value))
-    if key == "event_table_column_widths":
-        return _coerce_int_list(value)
     return str(value)
 
 
@@ -391,17 +257,3 @@ def _coerce_bool(value: Any) -> bool:
     raise ValueError(f"无法转换为布尔值: {value}")
 
 
-def _coerce_int_list(value: Any) -> list[int]:
-    """把 JSON 中的列表配置转换为整数列表。"""
-    if not isinstance(value, list):
-        return []
-
-    numbers: list[int] = []
-    for item in value:
-        try:
-            number = int(item)
-        except (TypeError, ValueError):
-            continue
-        if number > 0:
-            numbers.append(number)
-    return numbers

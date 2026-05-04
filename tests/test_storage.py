@@ -4,26 +4,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import sys
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-SAMPLES = ROOT / "references" / "hik_events"
-sys.path.insert(0, str(ROOT / "src"))
 
 from bdzc_parking.config import AppConfig
 from bdzc_parking.models import SendResult
 from bdzc_parking.parser import extract_event, parse_hikvision_payload
 from bdzc_parking.storage import EventStore, backup_database_and_reset, load_partner_payload
-
-
-CONTENT_TYPE = "multipart/form-data; boundary=---------------------------7e13971310878"
+from helpers import HIKVISION_CONTENT_TYPE, insert_request_record, sample_body
 
 
 def test_store_saves_event_image(tmp_path: Path) -> None:
     """新增事件时应保存过车图片，并在列表中只返回轻量图片信息。"""
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
-    raw = parse_hikvision_payload(CONTENT_TYPE, body)
+    body = sample_body("20260412_063354_226439_body.bin")
+    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
     event = extract_event(raw)
     store = EventStore(tmp_path / "events.sqlite3")
 
@@ -32,7 +25,7 @@ def test_store_saves_event_image(tmp_path: Path) -> None:
         "pending",
         True,
         partner_payload={"car": event.plate_no},
-        received_content_type=CONTENT_TYPE,
+        received_content_type=HIKVISION_CONTENT_TYPE,
         received_body=body,
     )
 
@@ -60,7 +53,7 @@ def test_store_saves_event_image(tmp_path: Path) -> None:
     )
     assert external_payload["img"].startswith("https://public.example.com/parking-images/")
     assert "%" not in external_payload["img"]
-    assert stored["received_content_type"] == CONTENT_TYPE
+    assert stored["received_content_type"] == HIKVISION_CONTENT_TYPE
     received_body_path = Path(stored["received_body_path"])
     saved_body = received_body_path.read_bytes()
     assert received_body_path.parent.name == "20260412"
@@ -179,8 +172,8 @@ def test_list_events_supports_gui_filters(tmp_path: Path) -> None:
 
 def test_reopen_store_migrates_legacy_failed_to_dead_letter(tmp_path: Path) -> None:
     """旧版本遗留的 failed 状态应在重新打开数据库时升级为 dead_letter。"""
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
-    raw = parse_hikvision_payload(CONTENT_TYPE, body)
+    body = sample_body("20260412_063354_226439_body.bin")
+    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
     event = extract_event(raw)
     db_path = tmp_path / "events.sqlite3"
 
@@ -205,8 +198,8 @@ def test_reopen_store_migrates_legacy_failed_to_dead_letter(tmp_path: Path) -> N
 
 def test_backup_database_and_reset_keeps_backup_and_allows_empty_reopen(tmp_path: Path) -> None:
     """备份并重置数据库后，备份保留旧记录，原路径可重新打开为空库。"""
-    body = (SAMPLES / "20260412_063354_226439_body.bin").read_bytes()
-    raw = parse_hikvision_payload(CONTENT_TYPE, body)
+    body = sample_body("20260412_063354_226439_body.bin")
+    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
     event = extract_event(raw)
     db_path = tmp_path / "events.sqlite3"
 
@@ -282,7 +275,7 @@ def test_migrate_raw_request_files_by_date_moves_root_files_and_updates_database
     root_file = store.request_dir / "20260412_162551_132336_sample.bin"
     root_file.parent.mkdir(parents=True, exist_ok=True)
     root_file.write_bytes(b"legacy-request")
-    event_id = _insert_request_record(store, "legacy-root-file", root_file.as_posix())
+    event_id = insert_request_record(store, "legacy-root-file", root_file.as_posix())
 
     summary = store.migrate_raw_request_files_by_date()
 
@@ -335,7 +328,7 @@ def test_migrate_raw_request_files_by_date_uses_unique_name_on_conflict(tmp_path
     target_dir.mkdir(parents=True, exist_ok=True)
     root_file.write_bytes(b"legacy-request")
     target_file.write_bytes(b"existing-request")
-    event_id = _insert_request_record(store, "legacy-conflict-file", root_file.as_posix())
+    event_id = insert_request_record(store, "legacy-conflict-file", root_file.as_posix())
 
     summary = store.migrate_raw_request_files_by_date()
 
@@ -346,26 +339,3 @@ def test_migrate_raw_request_files_by_date_uses_unique_name_on_conflict(tmp_path
     assert row["received_body_path"].endswith("_2.bin")
     assert Path(row["received_body_path"]).exists()
     assert target_file.read_bytes() == b"existing-request"
-
-
-def _insert_request_record(store: EventStore, event_key: str, received_body_path: str) -> int:
-    """插入一条只用于测试 raw request 路径迁移的最小事件记录。"""
-    with store._connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO events (
-                event_key, received_at, updated_at, status, raw_json,
-                received_content_type, received_body_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_key,
-                "2026-04-12T16:25:51",
-                "2026-04-12T16:25:51",
-                "parse_error",
-                "{}",
-                "application/octet-stream",
-                received_body_path,
-            ),
-        )
-        return int(cursor.lastrowid)

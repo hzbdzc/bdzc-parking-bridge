@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from bdzc_parking.common import format_seconds
 from bdzc_parking.config import AppConfig
 
 
@@ -77,8 +78,8 @@ def should_forward(
     if config is not None and received_at is not None:
         age_seconds = received_at.timestamp() - event.timestamp
         if age_seconds > config.max_event_age_seconds:
-            age_text = _format_seconds(age_seconds)
-            limit_text = _format_seconds(config.max_event_age_seconds)
+            age_text = format_seconds(age_seconds)
+            limit_text = format_seconds(config.max_event_age_seconds)
             return False, f"过车时间过旧: {age_text}秒 > {limit_text}秒"
     return True, ""
 
@@ -86,11 +87,6 @@ def should_forward(
 def has_partner_payload_inputs(event: HikEvent) -> bool:
     """判断事件是否具备生成大园区 payload 的最小字段。"""
     return event.direction in {"enter", "exit"} and bool(event.plate_no) and event.plate_no != "无车牌"
-
-
-def _format_seconds(value: float) -> str:
-    """把秒数格式化为适合跳过原因展示的简洁文本。"""
-    return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def map_to_partner_payload(event: HikEvent, config: AppConfig) -> dict[str, object]:

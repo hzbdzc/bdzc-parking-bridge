@@ -9,6 +9,7 @@ from email import policy
 from email.parser import BytesParser
 from typing import Any
 
+from bdzc_parking.common import first_non_empty_text, is_supported_image_part
 from bdzc_parking.models import HikEvent, HikEventImage
 
 
@@ -43,7 +44,7 @@ def extract_event(raw: dict[str, Any]) -> HikEvent:
 
     direction = str(passing_info.get("directionType", "")).strip()
     # 进场优先使用 enterTime，出场优先使用 exitTime，再按字段可用性兜底。
-    event_time = _first_non_empty(
+    event_time = first_non_empty_text(
         passing_info.get("enterTime") if direction == "enter" else None,
         passing_info.get("exitTime") if direction == "exit" else None,
         passing_info.get("enterTime"),
@@ -54,7 +55,7 @@ def extract_event(raw: dict[str, Any]) -> HikEvent:
         raise HikParseError("missing event time")
 
     # enterID/exitID 是最稳定的事件主键；缺失时再使用字段组合 hash。
-    event_key = _first_non_empty(
+    event_key = first_non_empty_text(
         passing_info.get("enterID") if direction == "enter" else None,
         passing_info.get("exitID") if direction == "exit" else None,
         passing_info.get("enterID"),
@@ -152,25 +153,10 @@ def _parse_timestamp(value: str) -> int:
         raise HikParseError(f"invalid event time: {value}") from exc
 
 
-def _first_non_empty(*values: object) -> str:
-    """返回第一个非空字符串值。"""
-    for value in values:
-        text = str(value).strip() if value is not None else ""
-        if text:
-            return text
-    return ""
-
-
 def _image_from_part(name: str | None, content_type: str, payload: bytes) -> HikEventImage | None:
     """把 multipart 中的图片 part 转换为过车图片对象。"""
-    if not payload:
-        return None
-
-    normalized_type = content_type.lower()
     normalized_name = (name or "").strip()
-    if not normalized_type.startswith("image/") and not normalized_name.lower().endswith(
-        (".jpg", ".jpeg", ".png")
-    ):
+    if not is_supported_image_part(normalized_name, content_type, payload):
         return None
 
     return HikEventImage(

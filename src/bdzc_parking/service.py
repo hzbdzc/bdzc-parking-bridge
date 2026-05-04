@@ -8,8 +8,9 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
+from bdzc_parking.common import iso_seconds_from_now, text_or
 from bdzc_parking.config import AppConfig
 from bdzc_parking.models import has_partner_payload_inputs, map_to_partner_payload, should_forward
 from bdzc_parking.parser import extract_event, parse_hikvision_payload, raw_body_key
@@ -24,6 +25,13 @@ _HTTP_INGRESS_SENTINEL = object()
 _MAINTENANCE_INTERVAL_SECONDS = 0.5
 _CLEANUP_INTERVAL_SECONDS = 3600.0
 _RETRY_DELAYS_SECONDS = (1.0, 5.0, 10.0)
+_SENDER_WORKER_COUNT = 4
+_SENDER_QUEUE_SIZE = 1000
+_HTTP_INGRESS_QUEUE_SIZE = 256
+_HTTP_INGRESS_WORKER_COUNT = 1
+_STALE_SENDING_SECONDS = 300.0
+_EVENT_RETENTION_DAYS = 180
+_ARTIFACT_RETENTION_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -50,17 +58,17 @@ class ParkingBridgeService:
         self._scheduled_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._maintenance_wakeup = threading.Event()
-        self._send_queue: queue.Queue[int] = queue.Queue(maxsize=self.config.sender_queue_size)
+        self._send_queue: queue.Queue[int] = queue.Queue(maxsize=_SENDER_QUEUE_SIZE)
         self._workers: list[threading.Thread] = []
         self._http_ingress_queue: queue.Queue[_HttpIngressRequest | object] = queue.Queue(
-            maxsize=self.config.http_ingress_queue_size
+            maxsize=_HTTP_INGRESS_QUEUE_SIZE
         )
         self._http_ingress_workers: list[threading.Thread] = []
         self._http_ingress_lock = threading.Lock()
         self._http_ingress_active_count = 0
         self._http_ingress_rejected_count = 0
 
-        recovered = self.store.recover_stale_sending(self.config.stale_sending_seconds)
+        recovered = self.store.recover_stale_sending(_STALE_SENDING_SECONDS)
         if recovered:
             LOGGER.warning("recovered %s stale sending records", recovered)
 
@@ -117,26 +125,31 @@ class ParkingBridgeService:
 
         can_send, skip_reason = should_forward(event, self.config, received_at)
         partner_payload = self._build_partner_payload(event)
-        LOGGER.info(
-            "Hik event ip=%s plate=%s direction=%s lane=%s gate=%s time=%s auto_send=%s%s",
-            client_ip,
-            _log_text(event.plate_no, "-"),
-            _direction_text(event.direction),
-            _log_text(event.lane_name, "-"),
-            _log_text(event.gate_name, "-"),
-            _log_text(event.event_time, "-"),
-            "yes" if can_send else "no",
-            f" skip_reason={skip_reason}" if skip_reason else "",
-        )
+        event_status = "pending" if can_send else "skipped"
         event_id, created = self.store.add_event(
             event,
-            status="pending" if can_send else "skipped",
+            status=event_status,
             auto_send=can_send,
             skip_reason=skip_reason,
             partner_payload=partner_payload,
             received_content_type=content_type,
             received_body=body,
             received_at=received_at.isoformat(timespec="seconds"),
+        )
+        LOGGER.info(
+            "Hik event stored event_id=%s event_key=%s created=%s ip=%s plate=%s direction=%s lane=%s gate=%s time=%s status=%s auto_send=%s%s",
+            event_id,
+            event.event_key,
+            "yes" if created else "no",
+            client_ip,
+            text_or(event.plate_no, "-"),
+            _direction_text(event.direction),
+            text_or(event.lane_name, "-"),
+            text_or(event.gate_name, "-"),
+            text_or(event.event_time, "-"),
+            event_status,
+            "yes" if can_send else "no",
+            f" skip_reason={skip_reason}" if skip_reason else "",
         )
         self._notify(event_id)
 
@@ -163,7 +176,7 @@ class ParkingBridgeService:
                 "HTTP ingress queue is full request_id=%s client=%s size=%s",
                 request_id,
                 client_ip,
-                self.config.http_ingress_queue_size,
+                _HTTP_INGRESS_QUEUE_SIZE,
             )
             return False
         return True
@@ -198,23 +211,41 @@ class ParkingBridgeService:
         result = self.client.send_once(payload, attempt=attempt)
         next_retry_at = "" if result.success else _next_retry_at(result.attempts)
         self.store.update_send_result(event_id, result, next_retry_at or None)
+        final_status = "sent" if result.success else ("failed_retryable" if next_retry_at else "dead_letter")
+        LOGGER.info(
+            "partner send result event_id=%s attempt=%s success=%s status_code=%s final_status=%s next_retry_at=%s error=%s",
+            event_id,
+            result.attempts,
+            "yes" if result.success else "no",
+            result.status_code if result.status_code is not None else "-",
+            final_status,
+            next_retry_at or "-",
+            text_or(result.error, "-"),
+        )
         self._notify(event_id)
 
     def get_status_snapshot(self) -> dict[str, object]:
-        """返回 /status 所需的最小运维指标快照。"""
-        snapshot = self.store.get_status_snapshot()
-        snapshot.update(
-            {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "server_running": True,
-                "queue_length": self._send_queue.qsize(),
-                **self.get_http_ingress_snapshot(),
-            }
-        )
-        return snapshot
+        """返回 /status 所需的数据库运维指标快照。"""
+        return self.store.get_status_snapshot()
+
+    def get_runtime_snapshot(self) -> dict[str, object]:
+        """返回不访问 SQLite 的运行队列和 worker 快照。"""
+        ingress = self.get_http_ingress_snapshot()
+        return {
+            "queues": {
+                "send": self._send_queue.qsize(),
+                "http_ingress": ingress["http_ingress_queue_length"],
+                "http_ingress_active": ingress["http_ingress_active_requests"],
+                "http_ingress_rejected": ingress["http_ingress_rejected_count"],
+            },
+            "workers": {
+                "http_ingress_alive": ingress["http_ingress_workers_alive"],
+                "http_ingress_total": ingress["http_ingress_worker_count"],
+            },
+        }
 
     def is_database_healthy(self) -> bool:
-        """检查 SQLite 是否可正常响应，供 /healthz 使用。"""
+        """检查 SQLite 是否可正常响应，供 /status 健康状态使用。"""
         return self.store.probe_database_health()
 
     def get_http_ingress_snapshot(self) -> dict[str, object]:
@@ -224,7 +255,7 @@ class ParkingBridgeService:
             rejected_count = self._http_ingress_rejected_count
         return {
             "http_ingress_queue_length": self._http_ingress_queue.qsize(),
-            "http_ingress_queue_size": self.config.http_ingress_queue_size,
+            "http_ingress_queue_size": _HTTP_INGRESS_QUEUE_SIZE,
             "http_ingress_workers_alive": sum(
                 1 for worker in self._http_ingress_workers if worker.is_alive()
             ),
@@ -259,7 +290,7 @@ class ParkingBridgeService:
 
     def _start_workers(self) -> None:
         """启动固定数量的发送 worker。"""
-        for index in range(self.config.sender_worker_count):
+        for index in range(_SENDER_WORKER_COUNT):
             worker = threading.Thread(
                 target=self._send_worker_loop,
                 name=f"partner-sender-{index + 1}",
@@ -270,7 +301,7 @@ class ParkingBridgeService:
 
     def _start_http_ingress_workers(self) -> None:
         """启动固定数量的 HTTP 接收 worker。"""
-        for index in range(self.config.http_ingress_workers):
+        for index in range(_HTTP_INGRESS_WORKER_COUNT):
             worker = threading.Thread(
                 target=self._http_ingress_worker_loop,
                 name=f"http-ingress-{index + 1}",
@@ -360,7 +391,7 @@ class ParkingBridgeService:
 
     def _schedule_pending_events(self) -> None:
         """扫描数据库中的可发送记录，并补入发送队列。"""
-        batch_limit = max(self.config.sender_queue_size, self.config.sender_worker_count * 2)
+        batch_limit = max(_SENDER_QUEUE_SIZE, _SENDER_WORKER_COUNT * 2)
         for event_id in self.store.list_ready_event_ids(limit=batch_limit):
             if not self._enqueue_send(event_id):
                 break
@@ -382,8 +413,8 @@ class ParkingBridgeService:
     def _run_cleanup(self) -> None:
         """执行事件和附件保留期清理。"""
         summary = self.store.prune_old_data(
-            self.config.event_retention_days,
-            self.config.artifact_retention_days,
+            _EVENT_RETENTION_DAYS,
+            _ARTIFACT_RETENTION_DAYS,
         )
         if any(summary.values()):
             LOGGER.info("cleanup summary: %s", summary)
@@ -398,15 +429,9 @@ def _direction_text(value: str) -> str:
     return value or "-"
 
 
-def _log_text(value: object, fallback: str = "-") -> str:
-    """把日志字段中的空值统一转换成更容易识别的占位文本。"""
-    text = str(value or "").strip()
-    return text or fallback
-
-
 def _next_retry_at(attempts: int) -> str:
     """按固定 1/5/10 秒策略计算下一次重试时间，超出次数则放弃自动重试。"""
     if attempts <= 0 or attempts > len(_RETRY_DELAYS_SECONDS):
         return ""
     delay_seconds = _RETRY_DELAYS_SECONDS[attempts - 1]
-    return (datetime.now() + timedelta(seconds=delay_seconds)).isoformat(timespec="seconds")
+    return iso_seconds_from_now(delay_seconds)

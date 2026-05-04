@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "PySide6>=6.11,<7",
+    "starlette>=1.0,<2",
+    "uvicorn>=0.46,<1",
 ]
 
 [project.scripts]

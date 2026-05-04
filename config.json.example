@@ -1,5 +1,4 @@
 ﻿{
-  "listen_host": "0.0.0.0",
   "listen_port": 1888,
   "listen_path": "/park",
   "auto_start_server": false,
@@ -13,25 +12,8 @@
   "local_entry_cname": "博达入口",
   "default_phone": "13800000000",
   "external_url_base": "https://public.example.com/parking-images",
-  "retry_count": 3,
-  "retry_delay_seconds": 1.0,
   "request_timeout_seconds": 5.0,
   "max_event_age_seconds": 60.0,
-  "max_request_bytes": 1048576,
-  "request_read_timeout_seconds": 15.0,
-  "http_watchdog_interval_seconds": 10.0,
-  "http_watchdog_timeout_seconds": 3.0,
-  "http_watchdog_failure_threshold": 2,
-  "http_watchdog_restart_cooldown_seconds": 30.0,
-  "sender_worker_count": 4,
-  "sender_queue_size": 1000,
-  "stale_sending_seconds": 300.0,
-  "event_retention_days": 180,
-  "artifact_retention_days": 30,
-  "image_rate_limit_per_minute": 60,
-  "image_rate_limit_burst": 20,
-  "event_page_size": 1000,
   "db_path": "data/bdzc_parking.sqlite3",
-  "log_path": "logs/bdzc_parking.log",
-  "event_table_column_widths": []
+  "log_path": "logs/bdzc_parking.log"
 }
