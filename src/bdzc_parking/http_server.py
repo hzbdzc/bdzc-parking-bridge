@@ -52,6 +52,9 @@ class BridgeHTTPServer:
         self._watchdog_last_restart_at = ""
         self._watchdog_next_restart_allowed_at = ""
         self._watchdog_next_restart_allowed_monotonic = 0.0
+        self._desired_running = False
+        self._last_thread_exit_at = ""
+        self._last_thread_exit_reason = ""
 
     @property
     def is_running(self) -> bool:
@@ -64,11 +67,20 @@ class BridgeHTTPServer:
         """启动后台 HTTP server 线程。"""
         with self._lock:
             self._cleanup_stopped_server_locked()
-            if self._server is None:
-                self._start_server_locked()
+            try:
+                if self._server is None:
+                    self._start_server_locked()
+                self._desired_running = True
+                self._start_watchdog_locked()
+            except Exception:
+                if self._server is None:
+                    self._desired_running = False
+                raise
 
     def stop(self) -> None:
         """停止 HTTP server 并等待后台线程退出。"""
+        with self._lock:
+            self._desired_running = False
         self._stop_watchdog()
         self._stop_current_server()
 
@@ -86,6 +98,9 @@ class BridgeHTTPServer:
                 "last_probe_error": self._watchdog_last_probe_error,
                 "last_restart_at": self._watchdog_last_restart_at,
                 "next_restart_allowed_at": next_restart_allowed_at,
+                "desired_running": self._desired_running,
+                "last_thread_exit_at": self._last_thread_exit_at,
+                "last_thread_exit_reason": self._last_thread_exit_reason,
             }
 
     def _start_server_locked(self) -> None:
@@ -125,9 +140,11 @@ class BridgeHTTPServer:
 
     def _serve_forever(self, server: _ServiceHTTPServer) -> None:
         """运行 HTTP server 主循环，并记录导致接收线程退出的异常。"""
+        exit_reason = "unknown"
         try:
             server.serve_forever()
-        except Exception:
+        except Exception as exc:
+            exit_reason = f"crashed: {type(exc).__name__}: {exc}"
             with self._lock:
                 is_active_server = self._server is server
             if is_active_server:
@@ -135,6 +152,7 @@ class BridgeHTTPServer:
             else:
                 LOGGER.debug("HTTP server thread exited during server cleanup", exc_info=True)
         else:
+            exit_reason = "serve_forever returned without exception"
             with self._lock:
                 is_active_server = self._server is server
             if is_active_server:
@@ -146,19 +164,21 @@ class BridgeHTTPServer:
             else:
                 LOGGER.debug("HTTP server serve_forever returned after stop server_id=%s", id(server))
         finally:
-            self._handle_server_thread_exit(server)
+            self._handle_server_thread_exit(server, exit_reason)
 
-    def _handle_server_thread_exit(self, server: _ServiceHTTPServer) -> None:
+    def _handle_server_thread_exit(self, server: _ServiceHTTPServer, reason: str) -> None:
         """接收线程退出时关闭仍被当前对象持有的监听 socket。"""
         with self._lock:
             if self._server is not server:
                 return
+            self._record_thread_exit_locked(reason)
             self._server = None
             self._thread = None
 
         LOGGER.warning(
-            "HTTP server thread exited unexpectedly; closing stale listening socket server_id=%s",
+            "HTTP server thread exited unexpectedly; closing stale listening socket server_id=%s reason=%s",
             id(server),
+            reason,
         )
         try:
             server.server_close()
@@ -223,6 +243,7 @@ class BridgeHTTPServer:
             self._server.server_close()
         except Exception:
             log_exception(LOGGER, "failed to close stale HTTP server socket")
+        self._record_thread_exit_locked("thread not alive during cleanup")
         self._server = None
         self._thread = None
 
@@ -237,12 +258,14 @@ class BridgeHTTPServer:
             daemon=True,
         )
         self._watchdog_thread.start()
+        LOGGER.info("HTTP server watchdog started")
 
     def _stop_watchdog(self) -> None:
         """停止 HTTP server 健康守护线程。"""
         with self._lock:
             thread = self._watchdog_thread
             self._watchdog_stop_event.set()
+            should_log = thread is not None
 
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
@@ -252,6 +275,8 @@ class BridgeHTTPServer:
         with self._lock:
             if self._watchdog_thread is thread:
                 self._watchdog_thread = None
+        if should_log:
+            LOGGER.info("HTTP server watchdog stopped")
 
     def _watchdog_loop(self) -> None:
         """周期性从本机探测 HTTP server，连续失败后自动重启。"""
@@ -267,6 +292,13 @@ class BridgeHTTPServer:
 
     def _watchdog_once(self) -> None:
         """执行一次 HTTP server 健康检查和必要的自动重启。"""
+        if not self._is_desired_running():
+            return
+        if self._is_server_missing_while_desired():
+            reason = "HTTP server is not running while desired"
+            self._record_watchdog_failure(reason)
+            self._restart_from_watchdog(reason)
+            return
         if self._is_server_thread_dead():
             reason = "HTTP server thread is not alive"
             self._record_watchdog_failure(reason)
@@ -288,6 +320,16 @@ class BridgeHTTPServer:
             if self._server is None:
                 return False
             return self._thread is None or not self._thread.is_alive()
+
+    def _is_server_missing_while_desired(self) -> bool:
+        """判断是否处于期望运行但当前没有 HTTP server 实例的异常状态。"""
+        with self._lock:
+            return self._desired_running and self._server is None
+
+    def _is_desired_running(self) -> bool:
+        """返回用户或配置是否仍期望 HTTP server 保持运行。"""
+        with self._lock:
+            return self._desired_running
 
     def _probe_http_root(self) -> tuple[bool, str]:
         """通过 GET / 从外部视角确认 HTTP server 是否可响应。"""
@@ -325,10 +367,17 @@ class BridgeHTTPServer:
             self._watchdog_failure_count += 1
             return self._watchdog_failure_count
 
+    def _record_thread_exit_locked(self, reason: str) -> None:
+        """在已持有锁时记录接收线程最近一次非主动退出原因。"""
+        self._last_thread_exit_at = datetime.now().isoformat(timespec="seconds")
+        self._last_thread_exit_reason = reason
+
     def _restart_from_watchdog(self, reason: str) -> None:
         """由 watchdog 触发 HTTP server 重启，并按 cooldown 限制频率。"""
         now = time.monotonic()
         with self._lock:
+            if not self._desired_running:
+                return
             if now < self._watchdog_next_restart_allowed_monotonic:
                 return
             cooldown_until = datetime.now() + timedelta(
@@ -346,6 +395,8 @@ class BridgeHTTPServer:
             log_exception(LOGGER, "HTTP server watchdog failed while stopping stale server")
         try:
             with self._lock:
+                if not self._desired_running:
+                    return
                 self._start_server_locked()
                 self._watchdog_failure_count = 0
                 self._watchdog_last_probe_error = ""

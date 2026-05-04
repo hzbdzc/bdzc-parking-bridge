@@ -181,9 +181,12 @@ def test_status_returns_failure_backlog_and_database_size(tmp_path: Path) -> Non
             assert payload["failure_backlog_count"] == 2
             assert payload["db_main_size_bytes"] > 0
             assert payload["db_total_size_bytes"] >= payload["db_main_size_bytes"]
-            assert payload["http_watchdog"]["enabled"] is False
+            assert payload["http_watchdog"]["enabled"] is True
             assert payload["http_watchdog"]["failure_count"] == 0
             assert payload["http_watchdog"]["restart_count"] == 0
+            assert payload["http_watchdog"]["desired_running"] is True
+            assert payload["http_watchdog"]["last_thread_exit_at"] == ""
+            assert payload["http_watchdog"]["last_thread_exit_reason"] == ""
 
 
 def test_setup_logging_adds_file_handler_when_root_already_has_handler(tmp_path: Path) -> None:
@@ -269,6 +272,201 @@ def test_http_server_can_restart_on_same_configured_port(tmp_path: Path) -> None
         assert manager.server._server.server_port == port
         with _open_url(_url(manager.server, "/healthz")) as response:
             assert response.status == 200
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_starts_and_stops_with_server(tmp_path: Path) -> None:
+    """HTTP server 启停时，watchdog 应同步启停且手动停止后不自动拉起。"""
+    manager = _bridge_server(
+        tmp_path,
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+    )
+    try:
+        manager.server.start()
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["enabled"] is True
+        assert snapshot["desired_running"] is True
+
+        manager.server.stop()
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["enabled"] is False
+        assert snapshot["desired_running"] is False
+        assert manager.server.is_running is False
+        time.sleep(0.15)
+        assert manager.server.is_running is False
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_restarts_after_consecutive_probe_failures(tmp_path: Path) -> None:
+    """连续探测失败达到阈值后，watchdog 应自动重启 HTTP server。"""
+    manager = _bridge_server(
+        tmp_path,
+        listen_port=_free_tcp_port(),
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_failure_threshold=2,
+        http_watchdog_restart_cooldown_seconds=0.5,
+    )
+    try:
+        manager.server.start()
+        port = manager.server._server.server_port
+        manager.server._probe_http_root = lambda: (False, "simulated probe failure")
+
+        assert _wait_until(
+            lambda: manager.server.get_watchdog_snapshot()["restart_count"] >= 1
+            and manager.server.is_running
+            and _root_is_healthy(port),
+            timeout=5.0,
+        )
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["last_restart_at"]
+        assert snapshot["last_probe_error"] == ""
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_restarts_when_server_thread_is_dead(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """接收线程已死但旧 server 对象仍残留时，watchdog 应清理旧实例并重启。"""
+    manager = _bridge_server(
+        tmp_path,
+        listen_port=_free_tcp_port(),
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_restart_cooldown_seconds=0.5,
+    )
+    try:
+        manager.server.start()
+        stale_server = manager.server._server
+        stale_thread = manager.server._thread
+        assert stale_server is not None
+        assert stale_thread is not None
+        port = stale_server.server_port
+
+        monkeypatch.setattr(manager.server, "_handle_server_thread_exit", lambda server, reason: None)
+        stale_server.shutdown()
+        stale_thread.join(timeout=3)
+        assert not stale_thread.is_alive()
+        assert manager.server._server is stale_server
+
+        assert _wait_until(
+            lambda: manager.server._server is not None
+            and manager.server._server is not stale_server
+            and manager.server.is_running
+            and _root_is_healthy(port),
+            timeout=5.0,
+        )
+        assert manager.server.get_watchdog_snapshot()["restart_count"] >= 1
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_restarts_when_server_was_cleared_after_thread_exit(tmp_path: Path) -> None:
+    """接收线程退出并把 server 清空后，期望运行状态应让 watchdog 自动重启。"""
+    manager = _bridge_server(
+        tmp_path,
+        listen_port=_free_tcp_port(),
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_restart_cooldown_seconds=0.5,
+    )
+    try:
+        manager.server.start()
+        stale_server = manager.server._server
+        stale_thread = manager.server._thread
+        assert stale_server is not None
+        assert stale_thread is not None
+        port = stale_server.server_port
+
+        stale_server.shutdown()
+        stale_thread.join(timeout=3)
+        assert not stale_thread.is_alive()
+        assert _wait_until(lambda: manager.server._server is None, timeout=3.0)
+
+        assert _wait_until(
+            lambda: manager.server._server is not None
+            and manager.server._server is not stale_server
+            and manager.server.is_running
+            and _root_is_healthy(port),
+            timeout=5.0,
+        )
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["restart_count"] >= 1
+        assert snapshot["last_thread_exit_at"]
+        assert snapshot["last_thread_exit_reason"] == "serve_forever returned without exception"
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_survives_probe_exception(tmp_path: Path) -> None:
+    """watchdog 单次探测异常时，不应让 watchdog 线程静默退出。"""
+    manager = _bridge_server(
+        tmp_path,
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_failure_threshold=3,
+    )
+    calls = {"count": 0}
+    try:
+        manager.server.start()
+
+        def fake_probe() -> tuple[bool, str]:
+            """第一次抛出探测异常，之后恢复成功。"""
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("forced probe failure")
+            return True, ""
+
+        manager.server._probe_http_root = fake_probe
+
+        assert _wait_until(lambda: calls["count"] >= 2, timeout=3.0)
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["enabled"] is True
+        assert snapshot["failure_count"] == 0
+        assert snapshot["restart_count"] == 0
+        assert snapshot["last_probe_error"] == ""
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_watchdog_clears_single_failure_without_restart(tmp_path: Path) -> None:
+    """一次失败后恢复成功时，watchdog 应清零失败计数且不重启。"""
+    manager = _bridge_server(
+        tmp_path,
+        http_watchdog_interval_seconds=0.05,
+        http_watchdog_timeout_seconds=0.05,
+        http_watchdog_failure_threshold=2,
+    )
+    calls = {"count": 0}
+    try:
+        manager.server.start()
+
+        def fake_probe() -> tuple[bool, str]:
+            """第一次返回失败，之后恢复成功。"""
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return False, "single simulated failure"
+            return True, ""
+
+        manager.server._probe_http_root = fake_probe
+
+        assert _wait_until(lambda: calls["count"] >= 2, timeout=3.0)
+        snapshot = manager.server.get_watchdog_snapshot()
+        assert snapshot["enabled"] is True
+        assert snapshot["failure_count"] == 0
+        assert snapshot["restart_count"] == 0
+        assert snapshot["last_probe_error"] == ""
     finally:
         manager.server.stop()
         manager.service.close()
