@@ -14,7 +14,7 @@
 - 图片下载按 IP 做令牌桶限流，避免外部反复刷图拖垮程序。
 - 发送链路使用固定后台 worker 和有界队列，避免下游 API 异常时线程数无限增长。
 - 提供最小运维接口：`GET /status` 返回健康状态、失败堆积、队列、数据库大小和 HTTP server 生命周期状态。
-- HTTP server 不做 watchdog 自动重启；非主动停止的线程退出会记录为故障，并在 GUI 状态栏和 `/status` 中显示。
+- HTTP server 由主进程托管 Uvicorn 子进程；主进程进行存活/健康检测，发现异常时自动重启子进程。
 - SQLite 启用 WAL / busy timeout，并按保留期清理过期事件、图片和原始报文。
 - 使用 Qt GUI 控制 HTTP server、分页查看过车列表和详情、载入/导出配置、查看日志、执行模拟发送测试。
 
@@ -53,7 +53,7 @@ GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会
 ## 运维接口
 
 - `GET /`：纯文本存活响应，保持兼容旧探针和人工检查方式。
-- `GET /status`：JSON 状态接口；返回进程和 SQLite 健康状态、失败堆积数、队列长度、最近一次成功发送时间、数据库大小和 `http_server.lifecycle`。
+- `GET /status`：JSON 状态接口；返回进程和 SQLite 健康状态、失败堆积数、队列长度、最近一次成功发送时间、数据库大小、`http_server.lifecycle`、`http_server.health` 和子进程指标。
 
 ## 配置说明
 
@@ -126,7 +126,7 @@ uv run python -m compileall -q src tests
 | [src/bdzc_parking/common.py](src/bdzc_parking/common.py) | 跨模块共享的纯工具函数，包含时间、JSON 展示、文件名、路径和图片 part 判断等无业务状态操作 |
 | [src/bdzc_parking/config.py](src/bdzc_parking/config.py) | 应用配置默认值、JSON 配置文件读取、字段类型转换和保存 |
 | [src/bdzc_parking/gui.py](src/bdzc_parking/gui.py) | PySide6 GUI，负责 HTTP server 控制、过车列表、右侧详情面板、配置弹窗、模拟发送测试和手动发送 |
-| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 基于 Uvicorn/Starlette 的海康消息接收 HTTP server、`/status` 运维接口、图片访问路由、请求限流和生命周期状态 |
+| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 主进程托管 Uvicorn 子进程的海康消息接收 HTTP server、`/status` 运维接口、图片访问路由、请求限流和生命周期状态 |
 | [src/bdzc_parking/models.py](src/bdzc_parking/models.py) | `HikEvent`、`HikEventImage`、`SendResult` 等跨模块数据模型，以及事件过滤和海康到大园区 payload 的方向反转映射 |
 | [src/bdzc_parking/maintenance.py](src/bdzc_parking/maintenance.py) | 一次性维护命令入口，负责执行历史 `raw_requests` 文件按日期整理等工具动作 |
 | [src/bdzc_parking/parser.py](src/bdzc_parking/parser.py) | 海康 multipart/JSON 解析、过车字段提取和图片 part 提取 |

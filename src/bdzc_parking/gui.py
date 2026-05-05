@@ -157,7 +157,7 @@ EVENT_TABLE_FILTER_KEYS = [
 ]
 FILTER_ALL_TEXT = "全部"
 FILTER_OPTION_LIMIT = 500
-EVENT_PAGE_SIZE = 1000
+EVENT_PAGE_SIZE = 500
 DEFAULT_EVENT_TABLE_WIDTHS = [70, 170, 110, 90, 120, 90, 110, 260]
 
 
@@ -487,7 +487,7 @@ class ConfigDialog(QDialog):
         notices = [headline]
         if imported_path is not None:
             notices.append("已导入外部配置；普通“保存配置”仍会写回当前活动配置文件。")
-        if self.http_server.is_running and previous.listen_port != self.http_server.config.listen_port:
+        if _http_server_is_active(self.http_server.get_control_snapshot()) and previous.listen_port != self.http_server.config.listen_port:
             notices.append("HTTP 监听参数变更需要停止并重新开始 HTTP server 后生效。")
         if previous.listen_path != self.http_server.config.listen_path:
             notices.append("接收路径变更会立即影响后续进入程序的 HTTP 请求。")
@@ -1184,7 +1184,7 @@ class MainWindow(QMainWindow):
     def _confirm_exit(self) -> bool:
         """弹出退出确认警告。"""
         message = "确认退出程序？"
-        if self.http_server.is_running:
+        if _http_server_is_active(self.http_server.get_control_snapshot()):
             message = "退出程序将停止 HTTP server，并中断外部图片访问和海康上报接收。是否继续？"
         result = QMessageBox.warning(
             self,
@@ -1422,7 +1422,7 @@ class MainWindow(QMainWindow):
     def backup_and_start_new_database(self) -> Path:
         """备份当前数据库，并重建运行服务以启用同一路径的新空库。"""
         db_path = Path(self.http_server.config.db_path)
-        was_running = self.http_server.is_running
+        was_running = _http_server_is_active(self.http_server.get_control_snapshot())
         old_service = self.service
         old_store = self.store
 
@@ -1494,9 +1494,15 @@ class MainWindow(QMainWindow):
 
     def toggle_server(self) -> None:
         """按当前运行状态切换 HTTP server 的开始或停止。"""
+        control = self.http_server.get_control_snapshot()
+        action = str(control.get("primary_action") or "none")
+        if action == "none":
+            self._update_buttons()
+            return
+
         self.server_button.setEnabled(False)
         try:
-            if self.http_server.is_running:
+            if action == "stop":
                 self.http_server.stop()
                 return
 
@@ -1725,39 +1731,43 @@ class MainWindow(QMainWindow):
 
     def _update_buttons(self) -> None:
         """根据 HTTP server 状态更新按钮文案和状态灯。"""
-        snapshot = self.http_server.get_lifecycle_snapshot()
-        state = str(snapshot.get("state") or "stopped")
-        running = state in {"starting", "running"}
-        label, color = _http_server_state_display(state)
-        failure_reason = str(snapshot.get("last_failure_reason") or "")
-        failure_at = str(snapshot.get("last_failed_at") or "")
+        control = self.http_server.get_control_snapshot()
+        label = str(control.get("display_text") or "未运行")
+        color = _http_server_severity_color(str(control.get("severity") or "idle"))
+        detail = str(control.get("detail") or "")
+        detail_at = str(control.get("detail_at") or "")
 
-        self.server_button.setText("停止 HTTP server" if running else "开始 HTTP server")
-        self.server_button.setEnabled(state not in {"starting", "stopping"})
+        self.server_button.setText(str(control.get("button_text") or "开始 HTTP server"))
+        self.server_button.setEnabled(bool(control.get("button_enabled", True)))
         self.status_dot.setStyleSheet(
             f"border: 1px solid #7a7a7a; border-radius: 7px; background: {color};"
         )
-        if state == "failed" and failure_reason:
-            self.status_label.setText(f"{label}: {failure_reason}")
-        else:
-            self.status_label.setText(label)
-        tooltip = ""
-        if failure_reason:
-            tooltip = f"{failure_at}\n{failure_reason}".strip()
-        self.status_label.setToolTip(tooltip)
+        self.status_label.setText(f"{label}: {detail}" if detail and control.get("display_state") == "failed" else label)
+        self.status_label.setToolTip(f"{detail_at}\n{detail}".strip() if detail else "")
 
 
-def _http_server_state_display(state: str) -> tuple[str, str]:
-    """把 HTTP server 生命周期状态转换为 GUI 文案和状态灯颜色。"""
-    if state == "starting":
-        return "启动中", "#bf8700"
-    if state == "running":
-        return "运行中", "#2da44e"
-    if state == "stopping":
-        return "停止中", "#bf8700"
-    if state == "failed":
-        return "故障", "#cf222e"
-    return "未运行", "#8c959f"
+def _http_server_severity_color(severity: str) -> str:
+    """把 HTTP server 提供的展示级别转换为状态灯颜色。"""
+    if severity == "ok":
+        return "#2da44e"
+    if severity == "warning":
+        return "#bf8700"
+    if severity == "error":
+        return "#cf222e"
+    if severity == "busy":
+        return "#bf8700"
+    return "#8c959f"
+
+
+def _http_server_is_active(control: dict[str, object]) -> bool:
+    """判断 HTTP server 是否处于需要停止/提示的活动状态。"""
+    return str(control.get("display_state") or "") in {
+        "starting",
+        "running",
+        "degraded",
+        "restarting",
+        "stopping",
+    }
 
 
 def _has_partner_payload(row: dict[str, object]) -> bool:

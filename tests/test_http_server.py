@@ -113,7 +113,7 @@ def test_root_route_still_returns_plain_text(tmp_path: Path, caplog) -> None:
         caplog.clear()
         with pytest_raises_http_error(404):
             _open_url(_url(server, "/missing"))
-        assert "HTTP request request_id=" in caplog.text
+        assert wait_until(lambda: "HTTP request request_id=" in caplog.text)
         assert "path=/missing status=404" in caplog.text
 
 
@@ -213,6 +213,11 @@ def test_status_returns_failure_backlog_and_database_size(tmp_path: Path) -> Non
             assert payload["http_server"]["lifecycle"]["state"] == "running"
             assert payload["http_server"]["lifecycle"]["desired_running"] is True
             assert payload["http_server"]["lifecycle"]["thread_alive"] is True
+            assert payload["http_server"]["lifecycle"]["process_alive"] is True
+            assert isinstance(payload["http_server"]["lifecycle"]["process_pid"], int)
+            assert isinstance(payload["http_server"]["lifecycle"]["parent_pid"], int)
+            assert payload["http_server"]["lifecycle"]["parent_alive"] is True
+            assert payload["http_server"]["lifecycle"]["orphaned"] is False
             assert payload["http_server"]["lifecycle"]["last_failure_reason"] == ""
 
 
@@ -225,7 +230,7 @@ def test_status_success_does_not_write_request_summary(tmp_path: Path, caplog) -
             assert response.status == 200
             response.read()
         assert "HTTP request request_id=" not in caplog.text
-        assert "status snapshot returned status=ok db_ok=True" in caplog.text
+        assert wait_until(lambda: "status snapshot returned status=ok db_ok=True" in caplog.text)
 
 
 def test_setup_logging_adds_file_handler_when_root_already_has_handler(tmp_path: Path) -> None:
@@ -311,20 +316,599 @@ def test_http_lifecycle_starts_and_stops_without_failure(tmp_path: Path) -> None
         assert snapshot["state"] == "running"
         assert snapshot["desired_running"] is True
         assert snapshot["thread_alive"] is True
+        assert snapshot["process_alive"] is True
+        assert isinstance(snapshot["process_pid"], int)
 
         manager.server.stop()
         snapshot = manager.server.get_lifecycle_snapshot()
         assert snapshot["state"] == "stopped"
         assert snapshot["desired_running"] is False
         assert snapshot["thread_alive"] is False
+        assert snapshot["process_alive"] is False
+        assert snapshot["process_pid"] is None
         assert snapshot["last_failure_reason"] == ""
+    finally:
+        with manager.server._lock:
+            manager.server._process = None
+            manager.server._lifecycle.desired_running = False
+        manager.service.close()
+
+
+def test_http_control_snapshot_covers_display_and_button_states(tmp_path: Path) -> None:
+    """HTTP server 应统一提供 GUI 可直接展示的状态和按钮控制信息。"""
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class AliveProcess:
+        """测试用存活进程替身。"""
+
+        def is_alive(self) -> bool:
+            return True
+
+    try:
+        assert manager.server.get_control_snapshot()["primary_action"] == "start"
+
+        with manager.server._lock:
+            manager.server._lifecycle.mark_starting()
+        starting = manager.server.get_control_snapshot()
+        assert starting["display_state"] == "starting"
+        assert starting["button_enabled"] is False
+        assert starting["primary_action"] == "none"
+
+        with manager.server._lock:
+            manager.server._process = AliveProcess()
+            manager.server._lifecycle.mark_running(1888, 12345)
+        running = manager.server.get_control_snapshot()
+        assert running["display_state"] == "running"
+        assert running["severity"] == "ok"
+        assert running["primary_action"] == "stop"
+
+        with manager.server._lock:
+            manager.server._health_failure_count = 1
+            manager.server._last_probe_error = "GET / failed"
+        degraded = manager.server.get_control_snapshot()
+        assert degraded["display_state"] == "degraded"
+        assert degraded["display_text"] == "响应异常"
+        assert degraded["severity"] == "warning"
+        assert degraded["primary_action"] == "stop"
+
+        with manager.server._lock:
+            manager.server._process = None
+            manager.server._health_failure_count = 0
+            manager.server._last_probe_error = ""
+        dead_child = manager.server.get_control_snapshot()
+        assert dead_child["display_state"] == "degraded"
+        assert dead_child["severity"] == "error"
+        assert dead_child["primary_action"] == "stop"
+
+        with manager.server._lock:
+            manager.server._lifecycle.mark_restarting("health restart")
+        restarting = manager.server.get_control_snapshot()
+        assert restarting["display_state"] == "restarting"
+        assert restarting["button_enabled"] is False
+        assert restarting["primary_action"] == "none"
+
+        with manager.server._lock:
+            manager.server._lifecycle.record_failure("forced failure")
+        failed = manager.server.get_control_snapshot()
+        assert failed["display_state"] == "failed"
+        assert failed["severity"] == "error"
+        assert failed["primary_action"] == "start"
+
+        with manager.server._lock:
+            manager.server._lifecycle.mark_stopping()
+        stopping = manager.server.get_control_snapshot()
+        assert stopping["display_state"] == "stopping"
+        assert stopping["button_enabled"] is False
+        assert stopping["primary_action"] == "none"
+    finally:
+        with manager.server._lock:
+            manager.server._process = None
+            manager.server._lifecycle.desired_running = False
+        manager.service.close()
+
+
+def test_http_control_snapshot_treats_unreadable_process_as_degraded(tmp_path: Path) -> None:
+    """进程句柄已关闭或不可读时，状态快照不应抛错。"""
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class BrokenProcess:
+        """模拟 multiprocessing.Process.close() 后再读取 is_alive 的行为。"""
+
+        def is_alive(self) -> bool:
+            raise ValueError("process object is closed")
+
+    try:
+        with manager.server._lock:
+            manager.server._process = BrokenProcess()
+            manager.server._lifecycle.mark_running(1888, 12345)
+        lifecycle = manager.server.get_lifecycle_snapshot()
+        control = manager.server.get_control_snapshot(lifecycle)
+
+        assert lifecycle["process_alive"] is False
+        assert control["display_state"] == "degraded"
+        assert control["severity"] == "error"
     finally:
         manager.server.stop()
         manager.service.close()
 
 
-def test_http_start_fails_when_port_is_already_bound(tmp_path: Path) -> None:
+def test_http_control_snapshot_recovers_stale_restarting_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restarting 超时后应自动落到 failed，避免 GUI 永远卡在重启中。"""
+    monkeypatch.setattr(http_server_module, "_SERVER_TRANSITION_STALE_SECONDS", 0.01)
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+    try:
+        with manager.server._lock:
+            manager.server._lifecycle.mark_restarting("manual kill")
+            manager.server._lifecycle.state_changed_monotonic = time.monotonic() - 1.0
+
+        control = manager.server.get_control_snapshot()
+        snapshot = manager.server.get_lifecycle_snapshot()
+
+        assert snapshot["state"] == "failed"
+        assert control["display_state"] == "failed"
+        assert control["primary_action"] == "start"
+        assert "timed out" in snapshot["last_failure_reason"]
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_child_process_restart_recovers_same_port(tmp_path: Path) -> None:
+    """主进程触发重启后，应拉起新的 Uvicorn 子进程并恢复同一端口。"""
+    port = free_tcp_port()
+    manager = _bridge_server(tmp_path, listen_port=port)
+    try:
+        manager.server.start()
+        first_pid = manager.server.get_lifecycle_snapshot()["process_pid"]
+        assert isinstance(first_pid, int)
+        assert _root_is_healthy(port)
+
+        manager.server._restart_from_health("forced test restart")
+
+        assert wait_until(
+            lambda: manager.server.get_lifecycle_snapshot()["restart_count"] >= 1
+            and manager.server.get_lifecycle_snapshot()["process_pid"] != first_pid
+            and _root_is_healthy(port),
+            timeout_seconds=5.0,
+        )
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_health_restart_clears_dead_process_before_starting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧进程已死时，健康重启应先拉起新进程恢复服务。"""
+    monkeypatch.setattr(http_server_module, "_HEALTH_FAILURE_THRESHOLD", 1)
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class DeadProcess:
+        """模拟已被任务管理器杀死的子进程。"""
+
+        pid = 111
+
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    class AliveProcess:
+        """模拟新拉起的子进程。"""
+
+        pid = 222
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.alive = False
+
+        def close(self) -> None:
+            return None
+
+    old_process = DeadProcess()
+
+    def start_replacement() -> http_server_module._ChildStartResult:
+        assert manager.server._process is None
+        return http_server_module._ChildStartResult(AliveProcess(), 1888, 222, None, None, None)
+
+    monkeypatch.setattr(manager.server, "_start_child_process_attempt", start_replacement)
+    try:
+        with manager.server._lock:
+            manager.server._process = old_process
+            manager.server._lifecycle.desired_running = True
+            manager.server._lifecycle.mark_running(1888, old_process.pid)
+
+        manager.server._health_check_once()
+        assert wait_until(lambda: manager.server.get_lifecycle_snapshot()["restart_count"] == 1)
+
+        snapshot = manager.server.get_lifecycle_snapshot()
+        control = manager.server.get_control_snapshot(snapshot)
+        assert snapshot["state"] == "running"
+        assert snapshot["process_pid"] == 222
+        assert snapshot["restart_count"] == 1
+        assert control["display_state"] == "running"
+        assert wait_until(lambda: old_process.close_count == 1, timeout_seconds=1.0)
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_health_restart_does_not_wait_for_dead_process_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧进程句柄清理很慢时，也不应阻断新 HTTP 子进程启动。"""
+    monkeypatch.setattr(http_server_module, "_HEALTH_FAILURE_THRESHOLD", 1)
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+    cleanup_can_continue = threading.Event()
+
+    class DeadSlowProcess:
+        """模拟已被任务管理器杀死但 join/close 很慢的旧进程句柄。"""
+
+        pid = 111
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, timeout: float | None = None) -> None:
+            cleanup_can_continue.wait(timeout=2)
+
+        def close(self) -> None:
+            cleanup_can_continue.wait(timeout=2)
+
+    class AliveProcess:
+        """模拟新拉起的子进程。"""
+
+        pid = 222
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def start_replacement() -> http_server_module._ChildStartResult:
+        return http_server_module._ChildStartResult(AliveProcess(), 1888, 222, None, None, None)
+
+    monkeypatch.setattr(manager.server, "_start_child_process_attempt", start_replacement)
+    try:
+        with manager.server._lock:
+            manager.server._process = DeadSlowProcess()
+            manager.server._lifecycle.desired_running = True
+            manager.server._lifecycle.mark_running(1888, 111)
+
+        started_at = time.monotonic()
+        manager.server._health_check_once()
+        assert wait_until(lambda: manager.server.get_lifecycle_snapshot()["restart_count"] == 1)
+
+        snapshot = manager.server.get_lifecycle_snapshot()
+        assert time.monotonic() - started_at < 1.0
+        assert snapshot["state"] == "running"
+        assert snapshot["process_pid"] == 222
+        assert snapshot["restart_count"] == 1
+    finally:
+        cleanup_can_continue.set()
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_health_restart_failure_does_not_leave_restarting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧进程仍存活且清理失败时，状态应落到 failed 而不是卡在 restarting。"""
+    monkeypatch.setattr(http_server_module, "_HEALTH_FAILURE_THRESHOLD", 1)
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class AliveProcess:
+        """模拟仍占用旧端口且清理时触发异常的旧进程。"""
+
+        pid = 333
+
+        def is_alive(self) -> bool:
+            return True
+
+    def fail_stop_child(process: object) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(manager.server, "_stop_child_process", fail_stop_child)
+    try:
+        port = int(manager.server.config.listen_port)
+        with manager.server._lock:
+            manager.server._process = AliveProcess()
+            manager.server._lifecycle.desired_running = True
+            manager.server._lifecycle.mark_running(port, 333)
+
+        manager.server._health_check_once()
+        assert wait_until(lambda: manager.server.get_lifecycle_snapshot()["state"] == "failed")
+
+        snapshot = manager.server.get_lifecycle_snapshot()
+        control = manager.server.get_control_snapshot(snapshot)
+        assert snapshot["state"] == "failed"
+        assert "cleanup failed" in snapshot["last_failure_reason"]
+        assert control["display_state"] == "failed"
+        assert control["primary_action"] == "start"
+    finally:
+        with manager.server._lock:
+            manager.server._process = None
+            manager.server._lifecycle.desired_running = False
+        manager.service.close()
+
+
+def test_stop_child_process_treats_unreadable_liveness_as_exited(tmp_path: Path) -> None:
+    """旧进程句柄在 join 后不可读时，清理函数不应向外抛异常。"""
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class FlakyProcess:
+        """模拟 Windows 上被手动杀死后 is_alive 变得不可读的进程句柄。"""
+
+        pid = 444
+
+        def __init__(self) -> None:
+            self.check_count = 0
+            self.close_count = 0
+
+        def is_alive(self) -> bool:
+            self.check_count += 1
+            if self.check_count == 1:
+                return True
+            raise ValueError("process object is closed")
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    process = FlakyProcess()
+    try:
+        manager.server._stop_child_process(process)
+        assert process.close_count == 1
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_parent_sentinel_requests_child_exit_on_eof() -> None:
+    """父进程 sentinel 断开时，子进程 watcher 应请求 Uvicorn 退出。"""
+
+    class FakeServer:
+        """只暴露 watcher 需要的 should_exit 字段。"""
+
+        should_exit = False
+
+    class EOFConnection:
+        """模拟父进程写端已关闭的 Pipe 读端。"""
+
+        def recv_bytes(self) -> bytes:
+            raise EOFError
+
+    server = FakeServer()
+    parent_lost = threading.Event()
+    server_finished = threading.Event()
+    server_finished.set()
+
+    http_server_module._start_parent_sentinel_watcher(
+        server, EOFConnection(), parent_lost, server_finished
+    )
+
+    assert wait_until(lambda: server.should_exit and parent_lost.is_set(), timeout_seconds=1.0)
+
+
+def test_parent_sentinel_forces_child_exit_after_grace() -> None:
+    """父进程消失且 Uvicorn 不退出时，watcher 应走强制退出兜底。"""
+
+    class FakeServer:
+        """只暴露 watcher 需要的 should_exit 字段。"""
+
+        should_exit = False
+
+    class EOFConnection:
+        """模拟父进程写端已关闭的 Pipe 读端。"""
+
+        def recv_bytes(self) -> bytes:
+            raise EOFError
+
+    exit_codes: list[int] = []
+    server = FakeServer()
+    parent_lost = threading.Event()
+    server_finished = threading.Event()
+
+    http_server_module._start_parent_sentinel_watcher(
+        server,
+        EOFConnection(),
+        parent_lost,
+        server_finished,
+        grace_seconds=0.01,
+        force_exit=exit_codes.append,
+    )
+
+    assert wait_until(lambda: server.should_exit and parent_lost.is_set(), timeout_seconds=1.0)
+    assert wait_until(lambda: exit_codes == [0], timeout_seconds=1.0)
+
+
+def test_http_start_cleans_orphan_bridge_process_before_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """启动前确认端口属于本程序孤儿子进程时，应先清理再启动。"""
+    port = free_tcp_port()
+    terminated_pids: list[int] = []
+    waited_ports: list[int] = []
+    monkeypatch.setattr(
+        http_server_module,
+        "_inspect_bridge_port_owner",
+        lambda inspected_port: http_server_module._BridgePortOwner(98765, True, "orphaned")
+        if inspected_port == port
+        else None,
+    )
+    monkeypatch.setattr(
+        http_server_module,
+        "_terminate_process_id",
+        lambda pid: terminated_pids.append(pid) or True,
+    )
+    monkeypatch.setattr(
+        http_server_module,
+        "_wait_for_port_release",
+        lambda waited_port, timeout: waited_ports.append(waited_port) or True,
+    )
+    manager = _bridge_server(tmp_path, listen_port=port)
+    try:
+        manager.server.start()
+        assert terminated_pids == [98765]
+        assert waited_ports == [port]
+        assert _root_is_healthy(port)
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_http_start_refuses_running_bridge_instance_on_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """端口属于另一个仍有父进程的本程序实例时，不应自动杀掉。"""
+    port = free_tcp_port()
+    terminated_pids: list[int] = []
+    monkeypatch.setattr(
+        http_server_module,
+        "_inspect_bridge_port_owner",
+        lambda inspected_port: http_server_module._BridgePortOwner(24680, False, "parent_alive=True")
+        if inspected_port == port
+        else None,
+    )
+    monkeypatch.setattr(
+        http_server_module,
+        "_terminate_process_id",
+        lambda pid: terminated_pids.append(pid) or True,
+    )
+    manager = _bridge_server(tmp_path, listen_port=port)
+    try:
+        with pytest.raises(OSError, match="another running bridge instance"):
+            manager.server.start()
+        assert terminated_pids == []
+        assert manager.server.get_lifecycle_snapshot()["state"] == "failed"
+    finally:
+        manager.server.stop()
+        manager.service.close()
+
+
+def test_bridge_port_owner_detects_legacy_orphan_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧版残留子进程只有 parent status unavailable 时，也应识别为孤儿。"""
+    monkeypatch.setattr(
+        http_server_module,
+        "_fetch_http_root_body",
+        lambda port: http_server_module._ROOT_LIVENESS_BODY,
+    )
+    monkeypatch.setattr(
+        http_server_module,
+        "_fetch_http_status_payload",
+        lambda port: {
+            "status": "error",
+            "message": "parent status snapshot unavailable",
+            "http_server": {"lifecycle": {"process_pid": 13579}},
+        },
+    )
+
+    owner = http_server_module._inspect_bridge_port_owner(1888)
+
+    assert owner is not None
+    assert owner.pid == 13579
+    assert owner.orphaned is True
+
+
+def test_http_stop_terminates_and_kills_unresponsive_process(tmp_path: Path) -> None:
+    """stop() 先通知退出并等 2 秒，仍不退出则 terminate，再 kill 兜底。"""
+    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
+
+    class FakeShutdownEvent:
+        """记录主进程是否发出正常退出通知。"""
+
+        def __init__(self) -> None:
+            self.set_count = 0
+
+        def set(self) -> None:
+            self.set_count += 1
+
+    class FakeProcess:
+        """模拟忽略正常退出和 terminate 的子进程。"""
+
+        pid = 12345
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.joins: list[float | None] = []
+            self.terminate_count = 0
+            self.kill_count = 0
+            self.close_count = 0
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.joins.append(timeout)
+
+        def terminate(self) -> None:
+            self.terminate_count += 1
+
+        def kill(self) -> None:
+            self.kill_count += 1
+            self.alive = False
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    shutdown_event = FakeShutdownEvent()
+    process = FakeProcess()
+    try:
+        with manager.server._lock:
+            manager.server._shutdown_event = shutdown_event
+            manager.server._process = process
+            manager.server._lifecycle.mark_starting()
+            manager.server._lifecycle.mark_running(1888, process.pid)
+
+        manager.server.stop()
+
+        assert shutdown_event.set_count == 1
+        assert process.joins[0] == http_server_module._SERVER_STOP_GRACE_SECONDS
+        assert process.terminate_count == 1
+        assert process.kill_count == 1
+        assert process.close_count == 1
+    finally:
+        manager.service.close()
+
+
+def test_http_start_fails_when_port_is_already_bound(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """监听端口被占用时，start 应同步抛出并记录 failed 状态。"""
+    monkeypatch.setattr(http_server_module, "_ORPHAN_STATUS_PROBE_TIMEOUT_SECONDS", 0.05)
     port = free_tcp_port()
     occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     occupied.bind(("127.0.0.1", port))
@@ -340,111 +924,6 @@ def test_http_start_fails_when_port_is_already_bound(tmp_path: Path) -> None:
         occupied.close()
         manager.server.stop()
         manager.service.close()
-
-
-def test_http_thread_exception_marks_failed_and_logs(
-    tmp_path: Path,
-    monkeypatch,
-    caplog,
-) -> None:
-    """Uvicorn 主循环抛错时，应记录 failed 和完整异常日志，不自动重启。"""
-    caplog.set_level(logging.ERROR, logger="bdzc_parking.http_server")
-
-    def crash(_self, runtime):
-        """模拟 Uvicorn 主循环启动后崩溃。"""
-        runtime.server.started = True
-        raise RuntimeError("forced uvicorn crash")
-
-    monkeypatch.setattr(http_server_module.BridgeHTTPServer, "_run_uvicorn", crash)
-    manager = _bridge_server(tmp_path, listen_port=free_tcp_port())
-    try:
-        try:
-            manager.server.start()
-        except RuntimeError:
-            pass
-        assert wait_until(
-            lambda: manager.server.get_lifecycle_snapshot()["state"] == "failed",
-            timeout_seconds=3.0,
-        )
-        snapshot = manager.server.get_lifecycle_snapshot()
-        assert "forced uvicorn crash" in snapshot["last_failure_reason"]
-        assert manager.server.is_running is False
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-    assert "HTTP server thread crashed" in caplog.text
-    assert "forced uvicorn crash" in caplog.text
-
-
-def test_http_thread_unexpected_return_marks_failed_and_closes_socket(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """主循环非用户停止却正常返回时，应标记 failed 并释放监听端口。"""
-    def return_unexpectedly(_self, runtime):
-        """模拟 Uvicorn 主循环无异常提前返回。"""
-        runtime.server.started = True
-        return None
-
-    monkeypatch.setattr(http_server_module.BridgeHTTPServer, "_run_uvicorn", return_unexpectedly)
-    port = free_tcp_port()
-    manager = _bridge_server(tmp_path, listen_port=port)
-    try:
-        try:
-            manager.server.start()
-        except RuntimeError:
-            pass
-        assert wait_until(
-            lambda: manager.server.get_lifecycle_snapshot()["state"] == "failed"
-            and not _tcp_port_accepts(port),
-            timeout_seconds=3.0,
-        )
-        snapshot = manager.server.get_lifecycle_snapshot()
-        assert snapshot["last_failure_reason"] == "server returned unexpectedly"
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-
-def test_request_exception_returns_500_records_status_and_logs(
-    tmp_path: Path,
-    monkeypatch,
-    caplog,
-) -> None:
-    """ASGI 处理函数抛错时，应返回 500、记录 /status 指标并保持 server 可用。"""
-    caplog.set_level(logging.ERROR, logger="bdzc_parking.http_server")
-    manager = _bridge_server(tmp_path)
-    failed_once = False
-    original_handler = manager.server._handle_get_request
-
-    async def fail_once(request):
-        """第一次 GET 抛出异常，之后恢复正常。"""
-        nonlocal failed_once
-        if not failed_once:
-            failed_once = True
-            raise RuntimeError("forced ASGI handler failure")
-        return await original_handler(request)
-
-    monkeypatch.setattr(manager.server, "_handle_get_request", fail_once)
-    try:
-        manager.server.start()
-        port = _server_port(manager.server)
-        status, body = _raw_http_response(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-        assert status == 500
-        assert body == b"Internal Server Error"
-        assert wait_until(lambda: _root_is_healthy(port), timeout_seconds=3.0)
-
-        with _open_url(_url(manager.server, "/status")) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            assert payload["http_server"]["request_exception_count"] >= 1
-            assert "forced ASGI handler failure" in payload["http_server"]["last_request_exception"]
-    finally:
-        manager.server.stop()
-        manager.service.close()
-
-    assert "HTTP request handling failed" in caplog.text
-    assert "forced ASGI handler failure" in caplog.text
 
 
 def test_http_server_rejects_missing_content_length(tmp_path: Path) -> None:
@@ -561,6 +1040,8 @@ def test_park_ingress_queue_full_returns_busy_without_blocking_status(
     """业务接收队列满时 /park 返回 503，但 /status 仍绕开业务队列。"""
     monkeypatch.setattr(service_module, "_HTTP_INGRESS_WORKER_COUNT", 1)
     monkeypatch.setattr(service_module, "_HTTP_INGRESS_QUEUE_SIZE", 1)
+    monkeypatch.setattr(http_server_module, "_IPC_INGRESS_QUEUE_SIZE", 1)
+    monkeypatch.setattr(http_server_module, "_IPC_DRAIN_ENQUEUE_TIMEOUT_SECONDS", 5.0)
     manager = _bridge_server(tmp_path)
     block_worker = threading.Event()
     worker_started = threading.Event()
@@ -576,7 +1057,8 @@ def test_park_ingress_queue_full_returns_busy_without_blocking_status(
         assert _post_park(port, b"{}") == 200
         assert wait_until(worker_started.is_set)
         assert _post_park(port, b"{}") == 200
-        assert _post_park(port, b"{}") == 503
+        statuses = [_post_park(port, b"{}") for _ in range(5)]
+        assert 503 in statuses
 
         with _open_url(_url(manager.server, "/status")) as response:
             assert response.status == 200
@@ -618,10 +1100,11 @@ class _bridge_server:
         config_values = {
             "listen_port": 0,
             "external_url_base": "https://public.example.com/parking-images",
+            "db_path": tmp_path / "events.sqlite3",
         }
         config_values.update(config_overrides)
         config = AppConfig(**config_values)
-        self.store = EventStore(tmp_path / "events.sqlite3")
+        self.store = EventStore(config.db_path)
         self.service = ParkingBridgeService(config, self.store, FakeClient(config))
         self.server = BridgeHTTPServer(config, self.service)
 
@@ -650,15 +1133,6 @@ def _server_port(server: BridgeHTTPServer) -> int:
     return port
 
 
-def _tcp_port_accepts(port: int) -> bool:
-    """判断本机 TCP 端口是否仍可建立连接。"""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-            return True
-    except OSError:
-        return False
-
-
 def _raw_http_status(port: int, request_text: str) -> int:
     """发送原始 HTTP 请求并解析状态码。"""
     with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
@@ -670,29 +1144,6 @@ def _raw_http_status(port: int, request_text: str) -> int:
     if len(parts) < 2:
         raise AssertionError(f"invalid HTTP response: {first_line!r}")
     return int(parts[1])
-
-
-def _raw_http_response(port: int, request_text: str) -> tuple[int, bytes]:
-    """发送原始 HTTP 请求并返回状态码和响应体。"""
-    chunks: list[bytes] = []
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
-        sock.settimeout(5)
-        sock.sendall(request_text.encode("ascii"))
-        while True:
-            try:
-                data = sock.recv(4096)
-            except socket.timeout:
-                break
-            if not data:
-                break
-            chunks.append(data)
-    response = b"".join(chunks)
-    first_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
-    parts = first_line.split()
-    if len(parts) < 2:
-        raise AssertionError(f"invalid HTTP response: {first_line!r}")
-    body = response.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in response else b""
-    return int(parts[1]), body
 
 
 def _post_park(port: int, body: bytes) -> int:

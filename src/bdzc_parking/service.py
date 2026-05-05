@@ -164,11 +164,16 @@ class ParkingBridgeService:
         body: bytes,
         client_ip: str = "unknown",
         request_id: int | str = "-",
+        block: bool = False,
+        timeout: float | None = None,
     ) -> bool:
         """把 HTTP 收到的原始请求放入有界接收队列，队列满时返回 False。"""
         item = _HttpIngressRequest(content_type, bytes(body), client_ip, request_id)
         try:
-            self._http_ingress_queue.put_nowait(item)
+            if block:
+                self._http_ingress_queue.put(item, block=True, timeout=timeout)
+            else:
+                self._http_ingress_queue.put_nowait(item)
         except queue.Full:
             with self._http_ingress_lock:
                 self._http_ingress_rejected_count += 1
