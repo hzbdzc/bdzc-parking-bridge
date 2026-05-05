@@ -25,7 +25,7 @@ _HTTP_INGRESS_SENTINEL = object()
 _MAINTENANCE_INTERVAL_SECONDS = 0.5
 _CLEANUP_INTERVAL_SECONDS = 3600.0
 _RETRY_DELAYS_SECONDS = (1.0, 5.0, 10.0)
-_SENDER_WORKER_COUNT = 4
+_SENDER_WORKER_COUNT = 1
 _SENDER_QUEUE_SIZE = 1000
 _HTTP_INGRESS_QUEUE_SIZE = 256
 _HTTP_INGRESS_WORKER_COUNT = 1
@@ -60,6 +60,8 @@ class ParkingBridgeService:
         self._maintenance_wakeup = threading.Event()
         self._send_queue: queue.Queue[int] = queue.Queue(maxsize=_SENDER_QUEUE_SIZE)
         self._workers: list[threading.Thread] = []
+        self._send_worker_lock = threading.Lock()
+        self._send_active_count = 0
         self._http_ingress_queue: queue.Queue[_HttpIngressRequest | object] = queue.Queue(
             maxsize=_HTTP_INGRESS_QUEUE_SIZE
         )
@@ -67,6 +69,8 @@ class ParkingBridgeService:
         self._http_ingress_lock = threading.Lock()
         self._http_ingress_active_count = 0
         self._http_ingress_rejected_count = 0
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_active_count = 0
 
         recovered = self.store.recover_stale_sending(_STALE_SENDING_SECONDS)
         if recovered:
@@ -236,6 +240,8 @@ class ParkingBridgeService:
     def get_runtime_snapshot(self) -> dict[str, object]:
         """返回不访问 SQLite 的运行队列和 worker 快照。"""
         ingress = self.get_http_ingress_snapshot()
+        sender = self.get_sender_snapshot()
+        maintenance = self.get_maintenance_snapshot()
         return {
             "queues": {
                 "send": self._send_queue.qsize(),
@@ -246,7 +252,44 @@ class ParkingBridgeService:
             "workers": {
                 "http_ingress_alive": ingress["http_ingress_workers_alive"],
                 "http_ingress_total": ingress["http_ingress_worker_count"],
+                "http_ingress_active": ingress["http_ingress_active_requests"],
+                "http_ingress_idle": ingress["http_ingress_idle_workers"],
+                "send_alive": sender["send_workers_alive"],
+                "send_total": sender["send_worker_count"],
+                "send_active": sender["send_active_requests"],
+                "send_idle": sender["send_idle_workers"],
+                "maintenance_alive": maintenance["maintenance_workers_alive"],
+                "maintenance_total": maintenance["maintenance_worker_count"],
+                "maintenance_active": maintenance["maintenance_active_requests"],
+                "maintenance_idle": maintenance["maintenance_idle_workers"],
             },
+        }
+
+    def get_sender_snapshot(self) -> dict[str, object]:
+        """返回大园区发送 worker 的运行状态。"""
+        with self._send_worker_lock:
+            active_count = self._send_active_count
+        alive_count = sum(1 for worker in self._workers if worker.is_alive())
+        total_count = len(self._workers)
+        return {
+            "send_queue_length": self._send_queue.qsize(),
+            "send_queue_size": _SENDER_QUEUE_SIZE,
+            "send_workers_alive": alive_count,
+            "send_worker_count": total_count,
+            "send_active_requests": active_count,
+            "send_idle_workers": max(0, alive_count - active_count),
+        }
+
+    def get_maintenance_snapshot(self) -> dict[str, object]:
+        """返回维护线程的运行状态。"""
+        with self._maintenance_lock:
+            active_count = self._maintenance_active_count
+        alive_count = 1 if self._maintenance_thread.is_alive() else 0
+        return {
+            "maintenance_workers_alive": alive_count,
+            "maintenance_worker_count": 1,
+            "maintenance_active_requests": active_count,
+            "maintenance_idle_workers": max(0, alive_count - active_count),
         }
 
     def is_database_healthy(self) -> bool:
@@ -266,6 +309,10 @@ class ParkingBridgeService:
             ),
             "http_ingress_worker_count": len(self._http_ingress_workers),
             "http_ingress_active_requests": active_count,
+            "http_ingress_idle_workers": max(
+                0,
+                sum(1 for worker in self._http_ingress_workers if worker.is_alive()) - active_count,
+            ),
             "http_ingress_rejected_count": rejected_count,
         }
 
@@ -363,11 +410,15 @@ class ParkingBridgeService:
             if event_id == _QUEUE_SENTINEL:
                 self._send_queue.task_done()
                 break
+            with self._send_worker_lock:
+                self._send_active_count += 1
             try:
                 self.send_record(event_id)
             except Exception:
                 LOGGER.exception("background send failed for event %s", event_id)
             finally:
+                with self._send_worker_lock:
+                    self._send_active_count -= 1
                 with self._scheduled_lock:
                     self._scheduled_event_ids.discard(event_id)
                 self._send_queue.task_done()
@@ -409,11 +460,17 @@ class ParkingBridgeService:
             self._maintenance_wakeup.clear()
             if self._stop_event.is_set():
                 break
-            self._schedule_pending_events()
-            now = time.monotonic()
-            if now - last_cleanup_at >= _CLEANUP_INTERVAL_SECONDS:
-                self._run_cleanup()
-                last_cleanup_at = now
+            with self._maintenance_lock:
+                self._maintenance_active_count += 1
+            try:
+                self._schedule_pending_events()
+                now = time.monotonic()
+                if now - last_cleanup_at >= _CLEANUP_INTERVAL_SECONDS:
+                    self._run_cleanup()
+                    last_cleanup_at = now
+            finally:
+                with self._maintenance_lock:
+                    self._maintenance_active_count -= 1
 
     def _run_cleanup(self) -> None:
         """执行事件和附件保留期清理。"""

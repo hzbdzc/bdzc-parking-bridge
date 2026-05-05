@@ -1216,9 +1216,6 @@ class MainWindow(QMainWindow):
         self.log_button = QPushButton("查看日志")
         self.help_button = QPushButton("帮助")
         self.exit_button = QPushButton("退出")
-        self.status_dot = QLabel()
-        self.status_dot.setFixedSize(14, 14)
-        self.status_label = QLabel()
 
         self.server_button.clicked.connect(self.toggle_server)
         self.config_button.clicked.connect(self.open_config_dialog)
@@ -1229,8 +1226,6 @@ class MainWindow(QMainWindow):
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.server_button)
-        top_bar.addWidget(self.status_dot)
-        top_bar.addWidget(self.status_label)
         top_bar.addSpacing(12)
         top_bar.addWidget(self.config_button)
         top_bar.addWidget(self.mock_button)
@@ -1307,9 +1302,34 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+        self._build_runtime_status_bar()
         self._refresh_filter_options()
         self._sync_filter_widths()
         self._update_buttons()
+        self._update_runtime_status_bar()
+
+    def _build_runtime_status_bar(self) -> None:
+        """创建底部运行状态栏，集中显示 HTTP 和 worker 状态灯。"""
+        self.runtime_status_dots: dict[str, QLabel] = {}
+        self.runtime_status_labels: dict[str, QLabel] = {}
+        container = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        for key in ("http", "send", "http_ingress", "maintenance"):
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            label = QLabel()
+            label.setMinimumWidth(90 if key == "http" else 72)
+            self.runtime_status_dots[key] = dot
+            self.runtime_status_labels[key] = label
+            layout.addWidget(dot)
+            layout.addWidget(label)
+            layout.addSpacing(8)
+        layout.addStretch(1)
+        container.setLayout(layout)
+        self.runtime_status_container = container
+        self.statusBar().addPermanentWidget(container, 1)
 
     def _build_filter_row(self) -> QScrollArea:
         """创建与列表列宽同步的表头筛选控件行。"""
@@ -1620,6 +1640,7 @@ class MainWindow(QMainWindow):
         """定时刷新列表和 HTTP server 生命周期显示。"""
         self.refresh_table()
         self._update_buttons()
+        self._update_runtime_status_bar()
 
     def show_selected_detail(self, _item: QTableWidgetItem | None = None) -> None:
         """左侧列表选择变化后，在右侧常驻面板显示完整详情。"""
@@ -1730,20 +1751,175 @@ class MainWindow(QMainWindow):
         self._sync_filter_widths()
 
     def _update_buttons(self) -> None:
-        """根据 HTTP server 状态更新按钮文案和状态灯。"""
+        """根据 HTTP server 状态更新控制按钮。"""
         control = self.http_server.get_control_snapshot()
-        label = str(control.get("display_text") or "未运行")
-        color = _http_server_severity_color(str(control.get("severity") or "idle"))
-        detail = str(control.get("detail") or "")
-        detail_at = str(control.get("detail_at") or "")
-
         self.server_button.setText(str(control.get("button_text") or "开始 HTTP server"))
         self.server_button.setEnabled(bool(control.get("button_enabled", True)))
-        self.status_dot.setStyleSheet(
-            f"border: 1px solid #7a7a7a; border-radius: 7px; background: {color};"
-        )
-        self.status_label.setText(f"{label}: {detail}" if detail and control.get("display_state") == "failed" else label)
-        self.status_label.setToolTip(f"{detail_at}\n{detail}".strip() if detail else "")
+
+    def _update_runtime_status_bar(self) -> None:
+        """刷新底部状态栏中的 HTTP 和 service worker 状态。"""
+        if not hasattr(self, "runtime_status_labels"):
+            return
+        try:
+            control = self.http_server.get_control_snapshot()
+            lifecycle = self.http_server.get_lifecycle_snapshot()
+            runtime = self.service.get_runtime_snapshot()
+        except Exception as exc:
+            tooltip = str(exc)
+            self._set_runtime_status_segment("http", "error", f"HTTP: 获取失败 {exc}", tooltip)
+            self._set_runtime_status_segment("send", "idle", "发送: -", tooltip)
+            self._set_runtime_status_segment("http_ingress", "idle", "接收: -", tooltip)
+            self._set_runtime_status_segment("maintenance", "idle", "维护: -", tooltip)
+            return
+
+        tooltip = _runtime_status_bar_tooltip(control, lifecycle, runtime)
+        for key, segment in _runtime_status_bar_segments(control, lifecycle, runtime).items():
+            self._set_runtime_status_segment(
+                key,
+                str(segment.get("severity") or "idle"),
+                str(segment.get("text") or ""),
+                tooltip,
+            )
+
+    def _set_runtime_status_segment(self, key: str, severity: str, text: str, tooltip: str) -> None:
+        """更新底部状态栏中的单个状态灯和文本。"""
+        dot = self.runtime_status_dots.get(key)
+        label = self.runtime_status_labels.get(key)
+        if dot is None or label is None:
+            return
+        color = _http_server_severity_color(severity)
+        dot.setStyleSheet(f"border: 1px solid #7a7a7a; border-radius: 5px; background: {color};")
+        dot.setToolTip(tooltip)
+        label.setText(text)
+        label.setToolTip(tooltip)
+        self.runtime_status_container.setToolTip(tooltip)
+
+
+def _runtime_status_bar_text(
+    control: dict[str, object],
+    lifecycle: dict[str, object],
+    runtime: dict[str, object],
+) -> str:
+    """生成底部状态栏的一行运行状态文本。"""
+    return " | ".join(
+        str(segment.get("text") or "")
+        for segment in _runtime_status_bar_segments(control, lifecycle, runtime).values()
+    )
+
+
+def _runtime_status_bar_segments(
+    control: dict[str, object],
+    lifecycle: dict[str, object],
+    runtime: dict[str, object],
+) -> dict[str, dict[str, str]]:
+    """生成底部状态栏各段文本和状态灯级别。"""
+    workers = _dict_value(runtime, "workers")
+    queues = _dict_value(runtime, "queues")
+    http_text = _http_runtime_text(control, lifecycle)
+    send_text = _worker_runtime_text(workers, "send")
+    ingress_text = _worker_runtime_text(workers, "http_ingress")
+    maintenance_text = _worker_runtime_text(workers, "maintenance")
+    send_queue = _int_value(queues, "send")
+    ingress_queue = _int_value(queues, "http_ingress")
+    return {
+        "http": {
+            "text": f"HTTP: {http_text}",
+            "severity": str(control.get("severity") or "idle"),
+        },
+        "send": {
+            "text": f"发送: {send_text} q={send_queue}",
+            "severity": _worker_runtime_severity(workers, "send"),
+        },
+        "http_ingress": {
+            "text": f"接收: {ingress_text} q={ingress_queue}",
+            "severity": _worker_runtime_severity(workers, "http_ingress"),
+        },
+        "maintenance": {
+            "text": f"维护: {maintenance_text}",
+            "severity": _worker_runtime_severity(workers, "maintenance"),
+        },
+    }
+
+
+def _runtime_status_bar_tooltip(
+    control: dict[str, object],
+    lifecycle: dict[str, object],
+    runtime: dict[str, object],
+) -> str:
+    """生成底部状态栏 tooltip，包含更完整的运行快照。"""
+    detail = str(control.get("detail") or "")
+    lines = [
+        _runtime_status_bar_text(control, lifecycle, runtime),
+        f"HTTP state: {lifecycle.get('state', '-')}",
+        f"HTTP failure: {detail or '-'}",
+        f"Workers: {_dict_value(runtime, 'workers')}",
+        f"Queues: {_dict_value(runtime, 'queues')}",
+    ]
+    return "\n".join(lines)
+
+
+def _http_runtime_text(control: dict[str, object], lifecycle: dict[str, object]) -> str:
+    """把 HTTP lifecycle 转换成紧凑的状态栏文本。"""
+    text = str(control.get("display_text") or lifecycle.get("state") or "未知")
+    detail = str(control.get("detail") or "").strip()
+    severity = str(control.get("severity") or "")
+    if detail and severity in {"error", "warning"}:
+        text = f"{text}: {_compact_status_detail(detail)}"
+    port = lifecycle.get("server_port")
+    pid = lifecycle.get("process_pid")
+    pieces = [text]
+    if port:
+        pieces.append(f"port={port}")
+    if pid:
+        pieces.append(f"pid={pid}")
+    return " ".join(pieces)
+
+
+def _worker_runtime_text(workers: dict[str, object], prefix: str) -> str:
+    """把单类 worker 的 alive/total/active/idle 字段转换成显示文本。"""
+    alive = _int_value(workers, f"{prefix}_alive")
+    total = _int_value(workers, f"{prefix}_total")
+    active = _int_value(workers, f"{prefix}_active")
+    if total <= 0 or alive <= 0:
+        state = "停止"
+    elif active > 0:
+        state = "忙碌"
+    else:
+        state = "空闲"
+    return f"{alive}/{total} {state}"
+
+
+def _worker_runtime_severity(workers: dict[str, object], prefix: str) -> str:
+    """把 worker 运行状态转换成状态灯级别。"""
+    alive = _int_value(workers, f"{prefix}_alive")
+    total = _int_value(workers, f"{prefix}_total")
+    active = _int_value(workers, f"{prefix}_active")
+    if total <= 0 or alive <= 0:
+        return "error"
+    if active > 0:
+        return "busy"
+    return "ok"
+
+
+def _compact_status_detail(detail: str, limit: int = 120) -> str:
+    """压缩状态栏中的故障详情，完整内容仍放在 tooltip。"""
+    if len(detail) <= limit:
+        return detail
+    return f"{detail[: max(0, limit - 3)]}..."
+
+
+def _dict_value(data: dict[str, object], key: str) -> dict[str, object]:
+    """从 dict 中安全读取嵌套 dict。"""
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _int_value(data: dict[str, object], key: str) -> int:
+    """从 dict 中安全读取整数值。"""
+    try:
+        return int(data.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _http_server_severity_color(severity: str) -> str:

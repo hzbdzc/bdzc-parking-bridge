@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,20 @@ class FlakyClient:
         self.attempts.append(attempt)
         if attempt <= self.fail_until:
             return SendResult(False, attempt, 200, '{"status":500,"msg":"temporary"}', "temporary")
+        return SendResult(True, attempt, 200, '{"status":200,"msg":"ok"}')
+
+
+class BlockingClient:
+    """发送时阻塞的客户端，用于观察 sender worker busy 状态。"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def send_once(self, payload: dict[str, object], attempt: int = 1) -> SendResult:
+        self.started.set()
+        self.release.wait(timeout=3)
         return SendResult(True, attempt, 200, '{"status":200,"msg":"ok"}')
 
 
@@ -283,3 +298,71 @@ def test_stale_sending_record_is_recovered_and_sent_again(
         assert recovered["attempts"] == 2
     finally:
         recovery_service.close()
+
+
+def test_runtime_snapshot_reports_single_idle_sender_worker(tmp_path: Path) -> None:
+    """运行快照应显示发送 worker 固定 1 个且空闲。"""
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    service = ParkingBridgeService(config, store, CapturingClient(config))
+    try:
+        snapshot = service.get_runtime_snapshot()
+        workers = snapshot["workers"]
+        assert workers["send_total"] == 1
+        assert workers["send_alive"] == 1
+        assert workers["send_active"] == 0
+        assert workers["send_idle"] == 1
+        assert workers["http_ingress_alive"] == service_module._HTTP_INGRESS_WORKER_COUNT
+        assert workers["maintenance_alive"] == 1
+    finally:
+        service.close()
+
+
+def test_runtime_snapshot_reports_busy_sender_worker(tmp_path: Path) -> None:
+    """发送阻塞期间，运行快照应显示 sender worker 忙碌。"""
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
+    store = EventStore(tmp_path / "events.sqlite3")
+    client = BlockingClient(config)
+    service = ParkingBridgeService(config, store, client)
+    body = sample_body("20260412_063354_226439_body.bin")
+    try:
+        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(client.started.is_set)
+
+        workers = service.get_runtime_snapshot()["workers"]
+        assert workers["send_total"] == 1
+        assert workers["send_alive"] == 1
+        assert workers["send_active"] == 1
+        assert workers["send_idle"] == 0
+    finally:
+        client.release.set()
+        service.close()
+
+
+def test_runtime_snapshot_reports_busy_maintenance_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """维护线程执行补捞时，运行快照应显示 maintenance worker 忙碌。"""
+    monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    service = ParkingBridgeService(config, store, CapturingClient(config))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_schedule_pending_events() -> None:
+        entered.set()
+        release.wait(timeout=3)
+
+    service._schedule_pending_events = slow_schedule_pending_events
+    try:
+        service._maintenance_wakeup.set()
+        assert wait_until(entered.is_set)
+        workers = service.get_runtime_snapshot()["workers"]
+        assert workers["maintenance_total"] == 1
+        assert workers["maintenance_alive"] == 1
+        assert workers["maintenance_active"] == 1
+        assert workers["maintenance_idle"] == 0
+    finally:
+        release.set()
+        service.close()
