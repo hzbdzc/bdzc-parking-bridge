@@ -1,42 +1,74 @@
-﻿"""桥接业务服务，串联解析、筛选、入库和发送流程。"""
+"""桥接业务服务，串联解析、筛选、入库、发送和定时清理流程。"""
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from bdzc_parking.common import iso_seconds_from_now, text_or
+from bdzc_parking.common import iso_now, text_or
 from bdzc_parking.config import AppConfig
-from bdzc_parking.models import has_partner_payload_inputs, map_to_partner_payload, should_forward
+from bdzc_parking.models import SendResult, has_partner_payload_inputs, map_to_partner_payload, should_forward
 from bdzc_parking.parser import extract_event, parse_hikvision_payload, raw_body_key
-from bdzc_parking.sender import PartnerClient
 from bdzc_parking.storage import EventStore, load_partner_payload
 
 
 LOGGER = logging.getLogger(__name__)
 Listener = Callable[[int], None]
-_QUEUE_SENTINEL = -1
-_HTTP_INGRESS_SENTINEL = object()
-_MAINTENANCE_INTERVAL_SECONDS = 0.5
+_TASK_SENTINEL = object()
 _CLEANUP_INTERVAL_SECONDS = 3600.0
 _RETRY_DELAYS_SECONDS = (1.0, 5.0, 10.0)
-_SENDER_WORKER_COUNT = 1
-_SENDER_QUEUE_SIZE = 1000
-_HTTP_INGRESS_QUEUE_SIZE = 256
-_HTTP_INGRESS_WORKER_COUNT = 1
-_STALE_SENDING_SECONDS = 300.0
+_SERVICE_WORKER_COUNT = 3
+_SERVICE_QUEUE_SIZE = 512
 _EVENT_RETENTION_DAYS = 180
 _ARTIFACT_RETENTION_DAYS = 30
 
 
+class PartnerClient:
+    """负责向大园区 API 发送转换后的过车记录。"""
+
+    def __init__(self, config: AppConfig):
+        """保存 API 地址和请求超时配置。"""
+        self.config = config
+
+    def send_once(self, payload: dict[str, object], attempt: int = 1) -> SendResult:
+        """向大园区 API 发起一次 HTTP POST。"""
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.config.partner_api_url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "text/json; charset=utf-8"},
+        )
+
+        try:
+            # 运行环境常带全局代理变量，桥接到园区/本机接口时要显式直连。
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=self.config.request_timeout_seconds) as response:
+                response_body = response.read().decode("utf-8", errors="replace")
+                return _interpret_response(attempt, response.status, response_body)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            LOGGER.debug("partner API HTTP error: %s %s", exc.code, body)
+            return SendResult(False, attempt, exc.code, body, f"HTTP {exc.code}")
+        except urllib.error.URLError as exc:
+            LOGGER.debug("partner API URL error: %s", exc)
+            return SendResult(False, attempt, error=str(exc.reason))
+        except OSError as exc:
+            LOGGER.debug("partner API send failed: %s", exc)
+            return SendResult(False, attempt, error=str(exc))
+
+
 @dataclass(frozen=True)
-class _HttpIngressRequest:
-    """HTTP 接收线程交给后台 worker 的原始请求任务。"""
+class _HttpIngressTask:
+    """HTTP 接收进程交给 service worker 的原始请求任务。"""
 
     content_type: str
     body: bytes
@@ -44,70 +76,64 @@ class _HttpIngressRequest:
     request_id: int | str
 
 
+@dataclass(frozen=True)
+class _ManualResendTask:
+    """GUI 交给 service worker 的手动重发任务。"""
+
+    event_id: int
+
+
+@dataclass(frozen=True)
+class _CleanupTask:
+    """service worker 定时执行的数据清理任务。"""
+
+    reason: str
+
+
 class ParkingBridgeService:
     """处理海康 HTTP 请求并驱动大园区同步。"""
 
     def __init__(self, config: AppConfig, store: EventStore, client: PartnerClient):
-        """保存配置、事件存储和大园区 API 客户端。"""
+        """保存配置、事件存储和大园区 API 客户端，并启动统一 worker 池。"""
         self.config = config
         self.store = store
         self.client = client
         self._listeners: list[Listener] = []
         self._listeners_lock = threading.Lock()
-        self._scheduled_event_ids: set[int] = set()
-        self._scheduled_lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._maintenance_wakeup = threading.Event()
-        self._send_queue: queue.Queue[int] = queue.Queue(maxsize=_SENDER_QUEUE_SIZE)
+        self._task_queue: queue.Queue[_HttpIngressTask | _ManualResendTask | _CleanupTask | object] = queue.Queue(
+            maxsize=_SERVICE_QUEUE_SIZE
+        )
         self._workers: list[threading.Thread] = []
-        self._send_worker_lock = threading.Lock()
-        self._send_active_count = 0
-        self._http_ingress_queue: queue.Queue[_HttpIngressRequest | object] = queue.Queue(
-            maxsize=_HTTP_INGRESS_QUEUE_SIZE
-        )
-        self._http_ingress_workers: list[threading.Thread] = []
-        self._http_ingress_lock = threading.Lock()
-        self._http_ingress_active_count = 0
-        self._http_ingress_rejected_count = 0
-        self._maintenance_lock = threading.Lock()
-        self._maintenance_active_count = 0
+        self._runtime_lock = threading.Lock()
+        self._active_count = 0
+        self._rejected_count = 0
+        self._task_failure_count = 0
+        self._last_error = ""
+        self._last_error_at = ""
+        self._cleanup_pending = False
+        self._cleanup_active = False
+        self._cleanup_started_at = ""
+        self._cleanup_finished_at = ""
+        self._cleanup_summary: dict[str, int] = {}
+        self._next_cleanup_at = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
+        self._send_ids_lock = threading.Lock()
+        self._active_send_ids: set[int] = set()
 
-        recovered = self.store.recover_stale_sending(_STALE_SENDING_SECONDS)
-        if recovered:
-            LOGGER.warning("recovered %s stale sending records", recovered)
-
-        self._start_http_ingress_workers()
         self._start_workers()
-        self._run_cleanup()
-        self._schedule_pending_events()
-        self._maintenance_thread = threading.Thread(
-            target=self._maintenance_loop,
-            name="parking-bridge-maintenance",
-            daemon=True,
-        )
-        self._maintenance_thread.start()
 
     def close(self) -> None:
-        """停止后台 worker 和维护线程。"""
+        """停止 service worker；发送等待会通过 stop_event 尽快中断。"""
         if self._stop_event.is_set():
             return
         self._stop_event.set()
-        self._maintenance_wakeup.set()
-        for _ in self._http_ingress_workers:
-            try:
-                self._http_ingress_queue.put_nowait(_HTTP_INGRESS_SENTINEL)
-            except queue.Full:
-                break
         for _ in self._workers:
             try:
-                self._send_queue.put_nowait(_QUEUE_SENTINEL)
+                self._task_queue.put_nowait(_TASK_SENTINEL)
             except queue.Full:
                 break
-        for worker in self._http_ingress_workers:
-            worker.join(timeout=2)
         for worker in self._workers:
             worker.join(timeout=2)
-        self._maintenance_thread.join(timeout=2)
 
     def add_listener(self, listener: Listener) -> None:
         """注册事件变化监听器，供 GUI 刷新表格使用。"""
@@ -115,15 +141,191 @@ class ParkingBridgeService:
             self._listeners.append(listener)
 
     def handle_request(self, content_type: str, body: bytes, client_ip: str = "unknown") -> None:
-        """处理一次海康 HTTP 消息：解析、入库，并在需要时自动发送。"""
-        received_at = datetime.now()
-
+        """同步处理一次海康 HTTP 消息，主要供测试和本地工具复用。"""
         try:
-            raw = parse_hikvision_payload(content_type, body)
+            self._handle_ingress_task(
+                _HttpIngressTask(content_type, bytes(body), client_ip, request_id="sync")
+            )
+        except Exception as exc:
+            self._record_error("synchronous ingress handling failed", exc)
+
+    def enqueue_http_request(
+        self,
+        content_type: str,
+        body: bytes,
+        client_ip: str = "unknown",
+        request_id: int | str = "-",
+        block: bool = False,
+        timeout: float | None = None,
+    ) -> bool:
+        """把 HTTP 收到的原始请求放入统一 service 队列，队列满时返回 False。"""
+        task = _HttpIngressTask(content_type, bytes(body), client_ip, request_id)
+        return self._enqueue_task(task, block=block, timeout=timeout, count_rejection=True)
+
+    def manual_resend(self, event_id: int) -> None:
+        """把可重发记录重置为待发送，并交给统一 service worker 处理。"""
+        if not self.store.set_manual_retry(event_id):
+            LOGGER.info("event %s is not resendable", event_id)
+            return
+        self._notify(event_id)
+        if not self._enqueue_task(_ManualResendTask(event_id), count_rejection=True):
+            self.store.mark_dead_letter(event_id, "service queue is full; manual resend was not scheduled")
+            self._notify(event_id)
+
+    def request_cleanup(self, reason: str = "manual") -> bool:
+        """投递一次手动旧数据清理任务，并重置下一次定时清理时间。"""
+        if self._stop_event.is_set():
+            return False
+        with self._runtime_lock:
+            if self._cleanup_active or self._cleanup_pending:
+                return False
+            self._cleanup_pending = True
+
+        if not self._enqueue_task(_CleanupTask(reason), count_rejection=True):
+            with self._runtime_lock:
+                self._cleanup_pending = False
+            return False
+
+        with self._runtime_lock:
+            self._next_cleanup_at = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
+        return True
+
+    def get_status_snapshot(self) -> dict[str, object]:
+        """返回 /status 所需的数据库运维指标快照。"""
+        return self.store.get_status_snapshot()
+
+    def get_runtime_snapshot(self) -> dict[str, object]:
+        """返回不访问 SQLite 的 service 队列、worker 和清理状态快照。"""
+        snapshot = self.get_service_snapshot()
+        return {
+            "queues": {
+                "service": snapshot["service_queue_length"],
+                "service_rejected": snapshot["service_rejected_count"],
+            },
+            "workers": {
+                "service_alive": snapshot["service_workers_alive"],
+                "service_total": snapshot["service_worker_count"],
+                "service_active": snapshot["service_active_tasks"],
+                "service_idle": snapshot["service_idle_workers"],
+            },
+            "cleanup": {
+                "active": snapshot["cleanup_active"],
+                "pending": snapshot["cleanup_pending"],
+                "started_at": snapshot["cleanup_started_at"],
+                "finished_at": snapshot["cleanup_finished_at"],
+                "summary": snapshot["cleanup_summary"],
+            },
+            "errors": {
+                "last_error": snapshot["last_error"],
+                "last_error_at": snapshot["last_error_at"],
+                "task_failures": snapshot["task_failure_count"],
+            },
+            "service_queue_length": snapshot["service_queue_length"],
+            "service_rejected_count": snapshot["service_rejected_count"],
+            "cleanup_active": snapshot["cleanup_active"],
+            "last_error": snapshot["last_error"],
+        }
+
+    def get_service_snapshot(self) -> dict[str, object]:
+        """返回统一 service worker 的运行状态。"""
+        with self._runtime_lock:
+            active_count = self._active_count
+            rejected_count = self._rejected_count
+            failure_count = self._task_failure_count
+            last_error = self._last_error
+            last_error_at = self._last_error_at
+            cleanup_pending = self._cleanup_pending
+            cleanup_active = self._cleanup_active
+            cleanup_started_at = self._cleanup_started_at
+            cleanup_finished_at = self._cleanup_finished_at
+            cleanup_summary = dict(self._cleanup_summary)
+        alive_count = sum(1 for worker in self._workers if worker.is_alive())
+        return {
+            "service_queue_length": self._task_queue.qsize(),
+            "service_queue_size": _SERVICE_QUEUE_SIZE,
+            "service_workers_alive": alive_count,
+            "service_worker_count": len(self._workers),
+            "service_active_tasks": active_count,
+            "service_idle_workers": max(0, alive_count - active_count),
+            "service_rejected_count": rejected_count,
+            "task_failure_count": failure_count,
+            "last_error": last_error,
+            "last_error_at": last_error_at,
+            "cleanup_pending": cleanup_pending,
+            "cleanup_active": cleanup_active,
+            "cleanup_started_at": cleanup_started_at,
+            "cleanup_finished_at": cleanup_finished_at,
+            "cleanup_summary": cleanup_summary,
+        }
+
+    def is_database_healthy(self) -> bool:
+        """检查 SQLite 是否可正常响应，供 /status 健康状态使用。"""
+        return self.store.probe_database_health()
+
+    def _start_workers(self) -> None:
+        """启动固定数量的统一 service worker。"""
+        for index in range(_SERVICE_WORKER_COUNT):
+            worker = threading.Thread(
+                target=self._service_worker_loop,
+                name=f"service-worker-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+
+    def _service_worker_loop(self) -> None:
+        """循环消费统一任务队列；顶层兜底保证 worker 不因任务异常退出。"""
+        while not self._stop_event.is_set():
+            try:
+                self._maybe_enqueue_cleanup()
+                try:
+                    task = self._task_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+
+                if task is _TASK_SENTINEL:
+                    self._task_queue.task_done()
+                    break
+
+                self._mark_worker_active(1)
+                try:
+                    self._handle_task(task)
+                except Exception as exc:
+                    self._record_error("service task failed", exc)
+                finally:
+                    self._mark_worker_active(-1)
+                    self._task_queue.task_done()
+            except Exception as exc:
+                self._record_error("service worker loop recovered from unexpected error", exc)
+                self._stop_event.wait(0.1)
+
+    def _handle_task(self, task: _HttpIngressTask | _ManualResendTask | _CleanupTask | object) -> None:
+        """按任务类型分发到具体业务处理函数。"""
+        if isinstance(task, _HttpIngressTask):
+            self._handle_ingress_task(task)
+            return
+        if isinstance(task, _ManualResendTask):
+            self._send_stored_record(task.event_id)
+            return
+        if isinstance(task, _CleanupTask):
+            self._handle_cleanup_task(task)
+            return
+        LOGGER.warning("unknown service task ignored: %r", task)
+
+    def _handle_ingress_task(self, task: _HttpIngressTask) -> None:
+        """解析并保存一条海康消息，需要发送时在当前 worker 内完成重试。"""
+        received_at = datetime.now()
+        try:
+            raw = parse_hikvision_payload(task.content_type, task.body)
             event = extract_event(raw)
         except Exception as exc:
-            LOGGER.exception("failed to parse Hikvision event from ip=%s", client_ip)
-            event_id = self.store.add_parse_error(raw_body_key(body), str(exc), content_type, body)
+            LOGGER.exception("failed to parse Hikvision event from ip=%s", task.client_ip)
+            event_id = self.store.add_parse_error(
+                raw_body_key(task.body),
+                str(exc),
+                task.content_type,
+                task.body,
+            )
             self._notify(event_id)
             return
 
@@ -136,16 +338,17 @@ class ParkingBridgeService:
             auto_send=can_send,
             skip_reason=skip_reason,
             partner_payload=partner_payload,
-            received_content_type=content_type,
-            received_body=body,
+            received_content_type=task.content_type,
+            received_body=task.body,
             received_at=received_at.isoformat(timespec="seconds"),
         )
         LOGGER.info(
-            "Hik event stored event_id=%s event_key=%s created=%s ip=%s plate=%s direction=%s lane=%s gate=%s time=%s status=%s auto_send=%s%s",
+            "Hik event stored event_id=%s event_key=%s created=%s request_id=%s ip=%s plate=%s direction=%s lane=%s gate=%s time=%s status=%s auto_send=%s%s",
             event_id,
             event.event_key,
             "yes" if created else "no",
-            client_ip,
+            task.request_id,
+            task.client_ip,
             text_or(event.plate_no, "-"),
             _direction_text(event.direction),
             text_or(event.lane_name, "-"),
@@ -158,177 +361,169 @@ class ParkingBridgeService:
         self._notify(event_id)
 
         if created and can_send:
-            self.send_record_async(event_id)
+            self._send_stored_record(event_id)
         elif not created:
             LOGGER.info("duplicate event ignored: %s", event.event_key)
 
-    def enqueue_http_request(
-        self,
-        content_type: str,
-        body: bytes,
-        client_ip: str = "unknown",
-        request_id: int | str = "-",
-        block: bool = False,
-        timeout: float | None = None,
-    ) -> bool:
-        """把 HTTP 收到的原始请求放入有界接收队列，队列满时返回 False。"""
-        item = _HttpIngressRequest(content_type, bytes(body), client_ip, request_id)
+    def _send_stored_record(self, event_id: int) -> None:
+        """读取已入库 payload，并在当前 worker 内完成最多四次发送。"""
+        if not self._try_mark_event_sending(event_id):
+            LOGGER.info("event %s is already being sent", event_id)
+            return
         try:
-            if block:
-                self._http_ingress_queue.put(item, block=True, timeout=timeout)
-            else:
-                self._http_ingress_queue.put_nowait(item)
-        except queue.Full:
-            with self._http_ingress_lock:
-                self._http_ingress_rejected_count += 1
-            LOGGER.warning(
-                "HTTP ingress queue is full request_id=%s client=%s size=%s",
-                request_id,
-                client_ip,
-                _HTTP_INGRESS_QUEUE_SIZE,
+            row = self.store.get_event(event_id)
+            if row is None:
+                LOGGER.info("event %s does not exist", event_id)
+                return
+
+            try:
+                payload = load_partner_payload(row, self.config)
+            except Exception as exc:
+                LOGGER.exception("failed to load partner payload for event %s", event_id)
+                self.store.mark_dead_letter(event_id, f"failed to load partner payload: {exc}")
+                self._notify(event_id)
+                return
+
+            if not payload:
+                LOGGER.info("event %s has no partner payload; mark dead letter", event_id)
+                self.store.mark_dead_letter(event_id, "event has no partner payload")
+                self._notify(event_id)
+                return
+
+            first_attempt_at = iso_now()
+            if not self.store.mark_send_started(event_id, first_attempt_at):
+                LOGGER.info("event %s cannot be marked sending", event_id)
+                return
+            self._notify(event_id)
+
+            result, last_attempt_at = self._send_payload_with_retries(event_id, payload)
+            if result is None:
+                reason = "service stopped before retries completed"
+                if self.store.reset_interrupted_send(event_id, reason):
+                    LOGGER.info("partner send aborted event_id=%s status=pending reason=%s", event_id, reason)
+                self._notify(event_id)
+                return
+            self.store.finish_send_result(
+                event_id,
+                result,
+                self.client.config.partner_api_url,
+                payload,
+                first_attempt_at,
+                last_attempt_at,
             )
-            return False
-        return True
+            final_status = "sent" if result.success else "dead_letter"
+            LOGGER.info(
+                "partner send result event_id=%s attempt=%s success=%s status_code=%s final_status=%s error=%s",
+                event_id,
+                result.attempts,
+                "yes" if result.success else "no",
+                result.status_code if result.status_code is not None else "-",
+                final_status,
+                text_or(result.error, "-"),
+            )
+            self._notify(event_id)
+        finally:
+            self._clear_event_sending(event_id)
 
-    def send_record_async(self, event_id: int) -> None:
-        """把指定事件加入后台发送队列。"""
-        self._schedule_send(event_id)
+    def _send_payload_with_retries(
+        self,
+        event_id: int,
+        payload: dict[str, object],
+    ) -> tuple[SendResult | None, str]:
+        """按 1/5/10 秒等待策略在当前 worker 内重试发送。"""
+        result = SendResult(False, 0, error="send was not attempted")
+        last_attempt_at = iso_now()
+        max_attempts = len(_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(1, max_attempts + 1):
+            last_attempt_at = iso_now()
+            try:
+                result = self.client.send_once(payload, attempt=attempt)
+            except Exception as exc:
+                LOGGER.exception("partner client raised for event %s attempt %s", event_id, attempt)
+                self._record_error(f"partner send exception event_id={event_id} attempt={attempt}", exc)
+                result = SendResult(False, attempt, error=str(exc))
 
-    def send_record(self, event_id: int) -> None:
-        """同步发送一条已入库事件，并回写 sending/重试/死信状态。"""
-        row = self.store.claim_ready_event(event_id)
-        if row is None:
-            return
-        self._notify(event_id)
+            if result.success:
+                return result, last_attempt_at
+            if attempt >= max_attempts:
+                return result, last_attempt_at
 
+            delay_seconds = _RETRY_DELAYS_SECONDS[attempt - 1]
+            LOGGER.info(
+                "partner send failed event_id=%s attempt=%s retry_after=%ss error=%s",
+                event_id,
+                attempt,
+                delay_seconds,
+                text_or(result.error, "-"),
+            )
+            if self._stop_event.wait(delay_seconds):
+                return None, last_attempt_at
+        return result, last_attempt_at
+
+    def _handle_cleanup_task(self, task: _CleanupTask) -> None:
+        """执行一次旧数据清理，任何异常由 worker 顶层兜底记录。"""
+        with self._runtime_lock:
+            self._cleanup_pending = False
+            self._cleanup_active = True
+            self._cleanup_started_at = iso_now()
         try:
-            payload = load_partner_payload(row, self.config)
+            LOGGER.info("cleanup started reason=%s", task.reason)
+            summary = self.store.prune_old_data(
+                _EVENT_RETENTION_DAYS,
+                _ARTIFACT_RETENTION_DAYS,
+            )
+            with self._runtime_lock:
+                self._cleanup_summary = dict(summary)
+                self._cleanup_finished_at = iso_now()
+                self._next_cleanup_at = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
+            LOGGER.info("cleanup finished reason=%s summary=%s", task.reason, summary)
         except Exception as exc:
-            LOGGER.exception("failed to load partner payload for event %s", event_id)
-            self.store.mark_dead_letter(event_id, f"failed to load partner payload: {exc}")
-            self._notify(event_id)
-            return
+            with self._runtime_lock:
+                self._cleanup_finished_at = iso_now()
+                self._next_cleanup_at = time.monotonic() + _CLEANUP_INTERVAL_SECONDS
+            LOGGER.warning("cleanup finished reason=%s success=no error=%s", task.reason, exc)
+            raise
+        finally:
+            with self._runtime_lock:
+                self._cleanup_active = False
 
-        if not payload:
-            LOGGER.info("event %s has no partner payload; mark dead letter", event_id)
-            self.store.mark_dead_letter(event_id, "event has no partner payload")
-            self._notify(event_id)
-            return
-
-        attempt = int(row.get("attempts") or 0) + 1
-        self.store.record_send_request(event_id, self.client.config.partner_api_url, payload)
-        result = self.client.send_once(payload, attempt=attempt)
-        next_retry_at = "" if result.success else _next_retry_at(result.attempts)
-        self.store.update_send_result(event_id, result, next_retry_at or None)
-        final_status = "sent" if result.success else ("failed_retryable" if next_retry_at else "dead_letter")
-        LOGGER.info(
-            "partner send result event_id=%s attempt=%s success=%s status_code=%s final_status=%s next_retry_at=%s error=%s",
-            event_id,
-            result.attempts,
-            "yes" if result.success else "no",
-            result.status_code if result.status_code is not None else "-",
-            final_status,
-            next_retry_at or "-",
-            text_or(result.error, "-"),
-        )
-        self._notify(event_id)
-
-    def get_status_snapshot(self) -> dict[str, object]:
-        """返回 /status 所需的数据库运维指标快照。"""
-        return self.store.get_status_snapshot()
-
-    def get_runtime_snapshot(self) -> dict[str, object]:
-        """返回不访问 SQLite 的运行队列和 worker 快照。"""
-        ingress = self.get_http_ingress_snapshot()
-        sender = self.get_sender_snapshot()
-        maintenance = self.get_maintenance_snapshot()
-        return {
-            "queues": {
-                "send": self._send_queue.qsize(),
-                "http_ingress": ingress["http_ingress_queue_length"],
-                "http_ingress_active": ingress["http_ingress_active_requests"],
-                "http_ingress_rejected": ingress["http_ingress_rejected_count"],
-            },
-            "workers": {
-                "http_ingress_alive": ingress["http_ingress_workers_alive"],
-                "http_ingress_total": ingress["http_ingress_worker_count"],
-                "http_ingress_active": ingress["http_ingress_active_requests"],
-                "http_ingress_idle": ingress["http_ingress_idle_workers"],
-                "send_alive": sender["send_workers_alive"],
-                "send_total": sender["send_worker_count"],
-                "send_active": sender["send_active_requests"],
-                "send_idle": sender["send_idle_workers"],
-                "maintenance_alive": maintenance["maintenance_workers_alive"],
-                "maintenance_total": maintenance["maintenance_worker_count"],
-                "maintenance_active": maintenance["maintenance_active_requests"],
-                "maintenance_idle": maintenance["maintenance_idle_workers"],
-            },
-        }
-
-    def get_sender_snapshot(self) -> dict[str, object]:
-        """返回大园区发送 worker 的运行状态。"""
-        with self._send_worker_lock:
-            active_count = self._send_active_count
-        alive_count = sum(1 for worker in self._workers if worker.is_alive())
-        total_count = len(self._workers)
-        return {
-            "send_queue_length": self._send_queue.qsize(),
-            "send_queue_size": _SENDER_QUEUE_SIZE,
-            "send_workers_alive": alive_count,
-            "send_worker_count": total_count,
-            "send_active_requests": active_count,
-            "send_idle_workers": max(0, alive_count - active_count),
-        }
-
-    def get_maintenance_snapshot(self) -> dict[str, object]:
-        """返回维护线程的运行状态。"""
-        with self._maintenance_lock:
-            active_count = self._maintenance_active_count
-        alive_count = 1 if self._maintenance_thread.is_alive() else 0
-        return {
-            "maintenance_workers_alive": alive_count,
-            "maintenance_worker_count": 1,
-            "maintenance_active_requests": active_count,
-            "maintenance_idle_workers": max(0, alive_count - active_count),
-        }
-
-    def is_database_healthy(self) -> bool:
-        """检查 SQLite 是否可正常响应，供 /status 健康状态使用。"""
-        return self.store.probe_database_health()
-
-    def get_http_ingress_snapshot(self) -> dict[str, object]:
-        """返回 HTTP 接收队列和后台 worker 的运行状态。"""
-        with self._http_ingress_lock:
-            active_count = self._http_ingress_active_count
-            rejected_count = self._http_ingress_rejected_count
-        return {
-            "http_ingress_queue_length": self._http_ingress_queue.qsize(),
-            "http_ingress_queue_size": _HTTP_INGRESS_QUEUE_SIZE,
-            "http_ingress_workers_alive": sum(
-                1 for worker in self._http_ingress_workers if worker.is_alive()
-            ),
-            "http_ingress_worker_count": len(self._http_ingress_workers),
-            "http_ingress_active_requests": active_count,
-            "http_ingress_idle_workers": max(
-                0,
-                sum(1 for worker in self._http_ingress_workers if worker.is_alive()) - active_count,
-            ),
-            "http_ingress_rejected_count": rejected_count,
-        }
-
-    def manual_resend(self, event_id: int) -> None:
-        """把可重发记录改回待发送状态，并异步重新发送。"""
-        if not self.store.set_manual_retry(event_id):
-            LOGGER.info("event %s is not resendable", event_id)
-            return
-        self._notify(event_id)
-        self.send_record_async(event_id)
+    def _maybe_enqueue_cleanup(self) -> None:
+        """到达一小时间隔后投递清理任务，避免重复投递。"""
+        now = time.monotonic()
+        with self._runtime_lock:
+            if self._cleanup_active or self._cleanup_pending or now < self._next_cleanup_at:
+                return
+            self._cleanup_pending = True
+        if not self._enqueue_task(_CleanupTask("scheduled"), count_rejection=False):
+            with self._runtime_lock:
+                self._cleanup_pending = False
 
     def _build_partner_payload(self, event) -> dict[str, object] | None:
-        """为可映射记录预生成 payload，供手动发送复用。"""
+        """为可映射记录预生成 payload，供自动发送和手动发送复用。"""
         if not has_partner_payload_inputs(event):
             return None
         return map_to_partner_payload(event, self.config)
+
+    def _enqueue_task(
+        self,
+        task: _HttpIngressTask | _ManualResendTask | _CleanupTask | object,
+        block: bool = False,
+        timeout: float | None = None,
+        count_rejection: bool = False,
+    ) -> bool:
+        """把任务放入统一队列，失败时按需累计拒绝计数。"""
+        try:
+            if block:
+                self._task_queue.put(task, block=True, timeout=timeout)
+            else:
+                self._task_queue.put_nowait(task)
+        except queue.Full:
+            if count_rejection:
+                with self._runtime_lock:
+                    self._rejected_count += 1
+            LOGGER.warning("service task queue is full; task rejected: %s", type(task).__name__)
+            return False
+        return True
 
     def _notify(self, event_id: int) -> None:
         """通知所有监听器某条事件记录发生变化。"""
@@ -340,146 +535,32 @@ class ParkingBridgeService:
             except Exception:
                 LOGGER.exception("event listener failed")
 
-    def _start_workers(self) -> None:
-        """启动固定数量的发送 worker。"""
-        for index in range(_SENDER_WORKER_COUNT):
-            worker = threading.Thread(
-                target=self._send_worker_loop,
-                name=f"partner-sender-{index + 1}",
-                daemon=True,
-            )
-            worker.start()
-            self._workers.append(worker)
+    def _mark_worker_active(self, delta: int) -> None:
+        """增减当前正在执行任务的 worker 数量。"""
+        with self._runtime_lock:
+            self._active_count = max(0, self._active_count + delta)
 
-    def _start_http_ingress_workers(self) -> None:
-        """启动固定数量的 HTTP 接收 worker。"""
-        for index in range(_HTTP_INGRESS_WORKER_COUNT):
-            worker = threading.Thread(
-                target=self._http_ingress_worker_loop,
-                name=f"http-ingress-{index + 1}",
-                daemon=True,
-            )
-            worker.start()
-            self._http_ingress_workers.append(worker)
+    def _record_error(self, context: str, exc: BaseException) -> None:
+        """记录最近一次 service 异常，并保证调用方可以继续恢复。"""
+        message = f"{context}: {exc}"
+        with self._runtime_lock:
+            self._task_failure_count += 1
+            self._last_error = message
+            self._last_error_at = iso_now()
+        LOGGER.exception(context)
 
-    def _http_ingress_worker_loop(self) -> None:
-        """循环消费 HTTP 原始请求队列，隔离慢业务和 HTTP 请求线程。"""
-        while True:
-            try:
-                item = self._http_ingress_queue.get(timeout=0.5)
-            except queue.Empty:
-                if self._stop_event.is_set():
-                    break
-                continue
-
-            if item is _HTTP_INGRESS_SENTINEL:
-                self._http_ingress_queue.task_done()
-                break
-            if not isinstance(item, _HttpIngressRequest):
-                self._http_ingress_queue.task_done()
-                continue
-
-            with self._http_ingress_lock:
-                self._http_ingress_active_count += 1
-            try:
-                LOGGER.debug(
-                    "HTTP ingress worker handling request_id=%s client=%s bytes=%s",
-                    item.request_id,
-                    item.client_ip,
-                    len(item.body),
-                )
-                self.handle_request(item.content_type, item.body, client_ip=item.client_ip)
-            except Exception:
-                LOGGER.exception(
-                    "HTTP ingress worker failed request_id=%s client=%s",
-                    item.request_id,
-                    item.client_ip,
-                )
-            finally:
-                with self._http_ingress_lock:
-                    self._http_ingress_active_count -= 1
-                self._http_ingress_queue.task_done()
-
-    def _send_worker_loop(self) -> None:
-        """循环消费发送队列中的待发送记录。"""
-        while not self._stop_event.is_set():
-            try:
-                event_id = self._send_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if event_id == _QUEUE_SENTINEL:
-                self._send_queue.task_done()
-                break
-            with self._send_worker_lock:
-                self._send_active_count += 1
-            try:
-                self.send_record(event_id)
-            except Exception:
-                LOGGER.exception("background send failed for event %s", event_id)
-            finally:
-                with self._send_worker_lock:
-                    self._send_active_count -= 1
-                with self._scheduled_lock:
-                    self._scheduled_event_ids.discard(event_id)
-                self._send_queue.task_done()
-                self._maintenance_wakeup.set()
-
-    def _schedule_send(self, event_id: int) -> None:
-        """调度单条记录进入发送队列；队列满时等待补捞线程稍后重试。"""
-        if self._enqueue_send(event_id):
-            return
-        self._maintenance_wakeup.set()
-
-    def _enqueue_send(self, event_id: int) -> bool:
-        """尝试把记录放入发送队列，避免重复入队。"""
-        with self._scheduled_lock:
-            if event_id in self._scheduled_event_ids:
-                return True
-            self._scheduled_event_ids.add(event_id)
-        try:
-            self._send_queue.put_nowait(event_id)
+    def _try_mark_event_sending(self, event_id: int) -> bool:
+        """在进程内防止同一事件被多个 worker 同时发送。"""
+        with self._send_ids_lock:
+            if event_id in self._active_send_ids:
+                return False
+            self._active_send_ids.add(event_id)
             return True
-        except queue.Full:
-            with self._scheduled_lock:
-                self._scheduled_event_ids.discard(event_id)
-            LOGGER.warning("send queue is full; event %s remains pending", event_id)
-            return False
 
-    def _schedule_pending_events(self) -> None:
-        """扫描数据库中的可发送记录，并补入发送队列。"""
-        batch_limit = max(_SENDER_QUEUE_SIZE, _SENDER_WORKER_COUNT * 2)
-        for event_id in self.store.list_ready_event_ids(limit=batch_limit):
-            if not self._enqueue_send(event_id):
-                break
-
-    def _maintenance_loop(self) -> None:
-        """周期性补捞 ready 记录，并执行保留期清理。"""
-        last_cleanup_at = time.monotonic()
-        while not self._stop_event.is_set():
-            self._maintenance_wakeup.wait(_MAINTENANCE_INTERVAL_SECONDS)
-            self._maintenance_wakeup.clear()
-            if self._stop_event.is_set():
-                break
-            with self._maintenance_lock:
-                self._maintenance_active_count += 1
-            try:
-                self._schedule_pending_events()
-                now = time.monotonic()
-                if now - last_cleanup_at >= _CLEANUP_INTERVAL_SECONDS:
-                    self._run_cleanup()
-                    last_cleanup_at = now
-            finally:
-                with self._maintenance_lock:
-                    self._maintenance_active_count -= 1
-
-    def _run_cleanup(self) -> None:
-        """执行事件和附件保留期清理。"""
-        summary = self.store.prune_old_data(
-            _EVENT_RETENTION_DAYS,
-            _ARTIFACT_RETENTION_DAYS,
-        )
-        if any(summary.values()):
-            LOGGER.info("cleanup summary: %s", summary)
+    def _clear_event_sending(self, event_id: int) -> None:
+        """清除进程内发送占用标记。"""
+        with self._send_ids_lock:
+            self._active_send_ids.discard(event_id)
 
 
 def _direction_text(value: str) -> str:
@@ -491,9 +572,16 @@ def _direction_text(value: str) -> str:
     return value or "-"
 
 
-def _next_retry_at(attempts: int) -> str:
-    """按固定 1/5/10 秒策略计算下一次重试时间，超出次数则放弃自动重试。"""
-    if attempts <= 0 or attempts > len(_RETRY_DELAYS_SECONDS):
-        return ""
-    delay_seconds = _RETRY_DELAYS_SECONDS[attempts - 1]
-    return iso_seconds_from_now(delay_seconds)
+def _interpret_response(attempt: int, status_code: int, response_text: str) -> SendResult:
+    """按大园区 API 约定解释 HTTP 响应是否成功。"""
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        return SendResult(False, attempt, status_code, response_text, "partner response is not JSON")
+
+    partner_status = data.get("status")
+    if status_code == 200 and str(partner_status) == "200":
+        return SendResult(True, attempt, status_code, response_text)
+
+    msg = data.get("msg") or f"partner status={partner_status}"
+    return SendResult(False, attempt, status_code, response_text, str(msg))

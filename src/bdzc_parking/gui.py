@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from collections.abc import Callable
@@ -43,14 +44,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bdzc_parking.common import json_loads_or_text, pretty_json_text
+from bdzc_parking.app import rotate_current_log_file
+from bdzc_parking.common import json_loads_or_text, pretty_json_text, text_or
 from bdzc_parking.config import AppConfig
 from bdzc_parking.http_server import BridgeHTTPServer
 from bdzc_parking.models import HikEvent, SendResult, map_to_partner_payload
-from bdzc_parking.sender import PartnerClient
-from bdzc_parking.service import ParkingBridgeService
+from bdzc_parking.service import ParkingBridgeService, PartnerClient
 from bdzc_parking.storage import EventStore, backup_database_and_reset, load_partner_payload
 
+
+LOGGER = logging.getLogger(__name__)
 
 CONFIG_FIELD_GROUPS = [
     (
@@ -105,7 +108,7 @@ CONFIG_FIELD_TOOLTIPS = {
     "listen_path": "海康终端上报消息时访问的 URL 路径，例如 /park；修改后会立即影响后续请求。",
     "auto_start_server": "勾选后，程序下次启动时会自动开始监听 HTTP server。",
     "partner_api_url": "大园区停车系统接收过车数据的 HTTP API 地址。",
-    "external_url_base": "图片对外访问的 URL 前缀，例如 https://host/parking-images；保存后会立即影响后续生成的图片外链。",
+    "external_url_base": "图片对外访问的 URL 前缀，例如 https://example.com/images  保存后会立即影响后续生成的图片外链。",
     "park_id": "发送给大园区 API 的停车场 ID。",
     "local_exit_hobby": "博达出口车辆出博达园区、进入上园路时发送的大园区类型，通常为 in。",
     "local_exit_cid": "博达出口通道 CID；车辆出博达园区、进入上园路时，发送 hobby=in。",
@@ -122,6 +125,7 @@ CONFIG_FIELD_TOOLTIPS = {
 
 READONLY_CONFIG_FIELDS = ("db_path", "log_path")
 OPTIONAL_CONFIG_FIELDS = {"external_url_base"}
+HTTP_REFRESH_CONFIG_KEYS = {"listen_port", "listen_path", "external_url_base"}
 
 DIRECTION_LABELS = {
     "enter": "我方入口进场",
@@ -137,10 +141,8 @@ PASSING_TYPE_LABELS = {
 STATUS_LABELS = {
     "pending": "待发送",
     "sending": "发送中",
-    "failed_retryable": "待重试",
     "dead_letter": "死信",
     "sent": "已发送",
-    "failed": "发送失败",
     "skipped": "已跳过",
     "parse_error": "解析失败",
 }
@@ -203,11 +205,15 @@ class ConfigDialog(QDialog):
         http_server: BridgeHTTPServer,
         reset_database_handler: Callable[[], Path] | None = None,
         parent: QWidget | None = None,
+        cleanup_handler: Callable[[], bool] | None = None,
+        log_rotate_handler: Callable[[], Path | None] | None = None,
     ):
         """绑定 HTTP server 配置对象并创建配置输入框。"""
         super().__init__(parent)
         self.http_server = http_server
         self.reset_database_handler = reset_database_handler
+        self.cleanup_handler = cleanup_handler
+        self.log_rotate_handler = log_rotate_handler
         self.config_fields: dict[str, QLineEdit | QCheckBox] = {}
         self.readonly_fields: dict[str, QLabel] = {}
         self._original_config = replace(self.http_server.config)
@@ -241,6 +247,12 @@ class ConfigDialog(QDialog):
         self.reset_database_button = QPushButton("备份并启用新数据库")
         self.reset_database_button.clicked.connect(self.reset_database)
         self.reset_database_button.setEnabled(self.reset_database_handler is not None)
+        self.cleanup_button = QPushButton("清理旧数据")
+        self.cleanup_button.clicked.connect(self.cleanup_old_data)
+        self.cleanup_button.setEnabled(self.cleanup_handler is not None)
+        self.rotate_log_button = QPushButton("轮转日志")
+        self.rotate_log_button.clicked.connect(self.rotate_log_file)
+        self.rotate_log_button.setEnabled(self.log_rotate_handler is not None)
         self.save_button = QPushButton("保存配置")
         self.save_button.clicked.connect(self.save_config)
         self.close_button = QPushButton("取消")
@@ -250,6 +262,8 @@ class ConfigDialog(QDialog):
         button_bar.addWidget(self.load_button)
         button_bar.addWidget(self.export_button)
         button_bar.addWidget(self.reset_database_button)
+        button_bar.addWidget(self.cleanup_button)
+        button_bar.addWidget(self.rotate_log_button)
         button_bar.addStretch(1)
         button_bar.addWidget(self.save_button)
         button_bar.addWidget(self.close_button)
@@ -356,6 +370,7 @@ class ConfigDialog(QDialog):
         self.http_server.config.save()
         self._load_config_fields()
         notices = self._config_change_notices(previous, f"配置已保存到 {self.http_server.config.config_path}")
+        self._append_http_refresh_notice(previous, notices, "config saved")
         self._saved = True
         QMessageBox.information(self, "配置已保存", "\n".join(notices))
         self.accept()
@@ -385,6 +400,7 @@ class ConfigDialog(QDialog):
             f"已从 {selected_path} 载入配置",
             imported_path=Path(selected_path),
         )
+        self._append_http_refresh_notice(previous, notices, "config loaded")
         QMessageBox.information(self, "配置已载入", "\n".join(notices))
 
     def save_to_file(self) -> None:
@@ -446,6 +462,68 @@ class ConfigDialog(QDialog):
             f"当前数据库已备份到：\n{backup_path}\n\n程序已启用新的空数据库。",
         )
 
+    def cleanup_old_data(self) -> None:
+        """确认后把旧数据清理任务投递给 service worker。"""
+        if self.cleanup_handler is None:
+            return
+        result = QMessageBox.warning(
+            self,
+            "确认清理旧数据",
+            (
+                "将按程序保留策略清理过期过车记录、请求原文、图片和孤儿文件。\n\n"
+                "清理任务会在后台 service worker 中执行，并重置下一次自动清理计时器。是否继续？"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            scheduled = self.cleanup_handler()
+        except Exception as exc:
+            QMessageBox.critical(self, "清理旧数据失败", str(exc))
+            return
+
+        if not scheduled:
+            QMessageBox.information(
+                self,
+                "清理旧数据未开始",
+                "已有清理任务正在执行或等待中，请稍后查看状态栏。",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "已开始清理旧数据",
+            "清理任务已交给 service worker，下一次自动清理计时器已重置。",
+        )
+
+    def rotate_log_file(self) -> None:
+        """确认后立即轮转当前日志文件。"""
+        if self.log_rotate_handler is None:
+            return
+        result = QMessageBox.warning(
+            self,
+            "确认轮转日志",
+            "将关闭当前日志文件并创建新的日志文件，历史日志按 180 天保留。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            archived_path = self.log_rotate_handler()
+        except Exception as exc:
+            QMessageBox.critical(self, "轮转日志失败", str(exc))
+            return
+
+        if archived_path is None:
+            QMessageBox.information(self, "日志未轮转", "当前日志文件为空或尚未生成。")
+            return
+        QMessageBox.information(self, "日志已轮转", f"历史日志已保存到：\n{archived_path}")
+
     def _build_candidate_config(self, config_path: Path | str) -> AppConfig:
         """把表单编辑值与当前只读配置合并成一个完整候选配置。"""
         data = self.http_server.config.to_dict()
@@ -487,12 +565,8 @@ class ConfigDialog(QDialog):
         notices = [headline]
         if imported_path is not None:
             notices.append("已导入外部配置；普通“保存配置”仍会写回当前活动配置文件。")
-        if _http_server_is_active(self.http_server.get_control_snapshot()) and previous.listen_port != self.http_server.config.listen_port:
-            notices.append("HTTP 监听参数变更需要停止并重新开始 HTTP server 后生效。")
-        if previous.listen_path != self.http_server.config.listen_path:
-            notices.append("接收路径变更会立即影响后续进入程序的 HTTP 请求。")
-        if previous.external_url_base != self.http_server.config.external_url_base:
-            notices.append("外部图片 URL base 已更新，后续生成的图片链接会立即按新地址拼接。")
+        if _http_config_changed(previous, self.http_server.config):
+            notices.append("HTTP 相关配置已变更。")
         if previous.db_path != self.http_server.config.db_path:
             notices.append("数据库路径变更需要重启程序后生效。")
         if previous.log_path != self.http_server.config.log_path:
@@ -501,11 +575,41 @@ class ConfigDialog(QDialog):
             notices.append("自动开启 HTTP server 会在下次程序启动时生效。")
         return notices
 
+    def _append_http_refresh_notice(self, previous: AppConfig, notices: list[str], reason: str) -> None:
+        """在 HTTP 相关配置变化后刷新运行中的 HTTP server，并把结果追加到提示。"""
+        if not _http_config_changed(previous, self.http_server.config):
+            return
+        refresh = getattr(self.http_server, "refresh", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh(reason)
+        except Exception as exc:
+            LOGGER.exception("failed to refresh HTTP server after config change")
+            notices.append(f"HTTP server 刷新失败：{exc}")
+            return
+        notices.append("HTTP server 已按最新配置刷新。")
+
+    def _refresh_http_after_restore(self, previous: AppConfig) -> None:
+        """取消未保存配置时，如 HTTP 配置被载入改过，则刷新回原配置。"""
+        if not _http_config_changed(previous, self.http_server.config):
+            return
+        refresh = getattr(self.http_server, "refresh", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh("config canceled")
+        except Exception as exc:
+            LOGGER.exception("failed to refresh HTTP server after config restore")
+            QMessageBox.warning(self, "HTTP server 刷新失败", str(exc))
+
     def reject(self) -> None:
         """取消配置编辑，回滚本次弹窗期间对共享配置的所有未保存变动。"""
         if not self._saved:
+            previous = replace(self.http_server.config)
             self.http_server.config.update_from_dict(self._original_config.to_dict())
             self.http_server.config.config_path = self._original_config.config_path
+            self._refresh_http_after_restore(previous)
         super().reject()
 
 
@@ -693,7 +797,6 @@ class EventDetailPanel(QWidget):
             ("发送次数", "attempts"),
             ("首次发送时间", "first_attempt_at"),
             ("最后尝试时间", "last_attempt_at"),
-            ("下次重试时间", "next_retry_at"),
             ("死信时间", "dead_lettered_at"),
             ("返回信息", "api_return_info"),
             ("自动发送", "auto_send"),
@@ -721,7 +824,6 @@ class EventDetailPanel(QWidget):
                 "updated_at",
                 "first_attempt_at",
                 "last_attempt_at",
-                "next_retry_at",
                 "dead_lettered_at",
             }:
                 value = _short_datetime(row.get(key))
@@ -769,6 +871,7 @@ class EventDetailPanel(QWidget):
             return
 
         def restore() -> None:
+            """把滚动条恢复到刷新前的位置。"""
             scrollbar = text_edit.verticalScrollBar()
             scrollbar.setValue(min(value, scrollbar.maximum()))
 
@@ -1014,7 +1117,21 @@ class MockSendDialog(QDialog):
     def _send_payload(self, payload: dict[str, object], api_url: str) -> None:
         """在线程中用临时 API 地址发送 payload，避免阻塞 Qt 主界面。"""
         mock_config = replace(self.service.config, partner_api_url=api_url)
-        result = PartnerClient(mock_config).send_once(payload)
+        try:
+            result = PartnerClient(mock_config).send_once(payload)
+        except Exception as exc:
+            LOGGER.exception("partner mock send raised")
+            result = SendResult(False, 1, error=str(exc))
+        final_status = "sent" if result.success else "dead_letter"
+        LOGGER.info(
+            "partner mock send result event_id=%s attempt=%s success=%s status_code=%s final_status=%s error=%s",
+            "mock",
+            result.attempts,
+            "yes" if result.success else "no",
+            result.status_code if result.status_code is not None else "-",
+            final_status,
+            text_or(result.error, "-"),
+        )
         self.signals.finished.emit(payload, result, api_url)
 
     def _show_send_result(
@@ -1316,7 +1433,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        for key in ("http", "send", "http_ingress", "maintenance"):
+        for key in ("http", "service"):
             dot = QLabel()
             dot.setFixedSize(10, 10)
             label = QLabel()
@@ -1434,10 +1551,22 @@ class MainWindow(QMainWindow):
 
     def open_config_dialog(self) -> None:
         """点击配置按钮后打开配置编辑弹窗。"""
-        dialog = ConfigDialog(self.http_server, self.backup_and_start_new_database, self)
+        dialog = ConfigDialog(
+            self.http_server,
+            self.backup_and_start_new_database,
+            self,
+            cleanup_handler=self.request_cleanup_old_data,
+            log_rotate_handler=self.rotate_log_file,
+        )
         dialog.exec()
         self.refresh_table()
         self._update_buttons()
+
+    def request_cleanup_old_data(self) -> bool:
+        """请求 service worker 手动执行一次旧数据清理。"""
+        scheduled = self.service.request_cleanup("manual")
+        self._update_runtime_status_bar()
+        return scheduled
 
     def backup_and_start_new_database(self) -> Path:
         """备份当前数据库，并重建运行服务以启用同一路径的新空库。"""
@@ -1506,6 +1635,13 @@ class MainWindow(QMainWindow):
             return
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path.resolve()))):
             QMessageBox.warning(self, "查看日志失败", f"无法打开日志文件：{log_path}")
+
+    def rotate_log_file(self) -> Path | None:
+        """调用 logging handler 立即轮转当前日志文件。"""
+        log_path = Path(self.http_server.config.log_path)
+        if not log_path.is_absolute():
+            log_path = Path.cwd() / log_path
+        return rotate_current_log_file(log_path)
 
     def show_help_dialog(self) -> None:
         """显示程序简介和简要使用帮助。"""
@@ -1767,9 +1903,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             tooltip = str(exc)
             self._set_runtime_status_segment("http", "error", f"HTTP: 获取失败 {exc}", tooltip)
-            self._set_runtime_status_segment("send", "idle", "发送: -", tooltip)
-            self._set_runtime_status_segment("http_ingress", "idle", "接收: -", tooltip)
-            self._set_runtime_status_segment("maintenance", "idle", "维护: -", tooltip)
+            self._set_runtime_status_segment("service", "idle", "Service: -", tooltip)
             return
 
         tooltip = _runtime_status_bar_tooltip(control, lifecycle, runtime)
@@ -1816,27 +1950,19 @@ def _runtime_status_bar_segments(
     workers = _dict_value(runtime, "workers")
     queues = _dict_value(runtime, "queues")
     http_text = _http_runtime_text(control, lifecycle)
-    send_text = _worker_runtime_text(workers, "send")
-    ingress_text = _worker_runtime_text(workers, "http_ingress")
-    maintenance_text = _worker_runtime_text(workers, "maintenance")
-    send_queue = _int_value(queues, "send")
-    ingress_queue = _int_value(queues, "http_ingress")
+    service_text = _worker_runtime_text(workers, "service")
+    service_queue = _int_value(queues, "service")
+    rejected_count = _int_value(queues, "service_rejected")
+    cleanup = _dict_value(runtime, "cleanup")
+    cleanup_active = bool(cleanup.get("active"))
     return {
         "http": {
             "text": f"HTTP: {http_text}",
             "severity": str(control.get("severity") or "idle"),
         },
-        "send": {
-            "text": f"发送: {send_text} q={send_queue}",
-            "severity": _worker_runtime_severity(workers, "send"),
-        },
-        "http_ingress": {
-            "text": f"接收: {ingress_text} q={ingress_queue}",
-            "severity": _worker_runtime_severity(workers, "http_ingress"),
-        },
-        "maintenance": {
-            "text": f"维护: {maintenance_text}",
-            "severity": _worker_runtime_severity(workers, "maintenance"),
+        "service": {
+            "text": f"Service: {service_text} q={service_queue} rejected={rejected_count}",
+            "severity": "busy" if cleanup_active else _worker_runtime_severity(workers, "service"),
         },
     }
 
@@ -1854,6 +1980,8 @@ def _runtime_status_bar_tooltip(
         f"HTTP failure: {detail or '-'}",
         f"Workers: {_dict_value(runtime, 'workers')}",
         f"Queues: {_dict_value(runtime, 'queues')}",
+        f"Cleanup: {_dict_value(runtime, 'cleanup')}",
+        f"Errors: {_dict_value(runtime, 'errors')}",
     ]
     return "\n".join(lines)
 
@@ -1944,6 +2072,14 @@ def _http_server_is_active(control: dict[str, object]) -> bool:
         "restarting",
         "stopping",
     }
+
+
+def _http_config_changed(previous: AppConfig, current: AppConfig) -> bool:
+    """判断是否修改了需要刷新 HTTP 子进程的配置项。"""
+    return any(
+        getattr(previous, key) != getattr(current, key)
+        for key in HTTP_REFRESH_CONFIG_KEYS
+    )
 
 
 def _has_partner_payload(row: dict[str, object]) -> bool:
@@ -2121,11 +2257,7 @@ def _table_row_background(row: dict[str, object]) -> QColor | None:
         return QColor("#EAF7EA")
     if status == "skipped":
         return QColor("#FFF8D8")
-    if status == "failed_retryable":
-        return QColor("#FFF2D8")
     if status == "dead_letter":
-        return QColor("#FDECEC")
-    if status == "failed":
         return QColor("#FDECEC")
     return None
 

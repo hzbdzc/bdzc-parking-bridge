@@ -20,7 +20,6 @@ from bdzc_parking.common import (
     is_supported_image_part,
     iso_days_ago,
     iso_now,
-    iso_seconds_ago,
     timestamp_for_filename,
     unique_path,
 )
@@ -39,6 +38,38 @@ EVENT_FILTER_COLUMNS = {
     "status": "status",
 }
 EVENT_DATE_EXPRESSION = "substr(COALESCE(NULLIF(event_time, ''), received_at), 1, 10)"
+EVENT_TABLE_COLUMNS = (
+    ("id", "INTEGER PRIMARY KEY AUTOINCREMENT", ""),
+    ("event_key", "TEXT NOT NULL UNIQUE", ""),
+    ("received_at", "TEXT NOT NULL", "TEXT NOT NULL DEFAULT ''"),
+    ("updated_at", "TEXT NOT NULL", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL", "TEXT NOT NULL DEFAULT ''"),
+    ("auto_send", "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
+    ("skip_reason", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("event_time", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("direction", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("passing_type", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("plate_no", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("gate_name", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("lane_name", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("raw_json", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("received_content_type", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("received_body_path", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("partner_payload_json", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("last_request_url", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("last_request_payload_json", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("image_name", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("image_content_type", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("image_path", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("image_data", "BLOB", "BLOB"),
+    ("attempts", "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0"),
+    ("first_attempt_at", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("last_attempt_at", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("dead_lettered_at", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("status_code", "INTEGER", "INTEGER"),
+    ("response_text", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+    ("last_error", "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -65,50 +96,13 @@ class EventStore:
         self.init_db()
 
     def init_db(self) -> None:
-        """创建事件记录表。"""
+        """创建或迁移事件记录表。"""
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_key TEXT NOT NULL UNIQUE,
-                    received_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    auto_send INTEGER NOT NULL DEFAULT 0,
-                    skip_reason TEXT NOT NULL DEFAULT '',
-                    event_time TEXT NOT NULL DEFAULT '',
-                    direction TEXT NOT NULL DEFAULT '',
-                    passing_type TEXT NOT NULL DEFAULT '',
-                    plate_no TEXT NOT NULL DEFAULT '',
-                    gate_name TEXT NOT NULL DEFAULT '',
-                    lane_name TEXT NOT NULL DEFAULT '',
-                    raw_json TEXT NOT NULL DEFAULT '',
-                    received_content_type TEXT NOT NULL DEFAULT '',
-                    received_body_path TEXT NOT NULL DEFAULT '',
-                    partner_payload_json TEXT NOT NULL DEFAULT '',
-                    last_request_url TEXT NOT NULL DEFAULT '',
-                    last_request_payload_json TEXT NOT NULL DEFAULT '',
-                    image_name TEXT NOT NULL DEFAULT '',
-                    image_content_type TEXT NOT NULL DEFAULT '',
-                    image_path TEXT NOT NULL DEFAULT '',
-                    image_data BLOB,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    first_attempt_at TEXT NOT NULL DEFAULT '',
-                    last_attempt_at TEXT NOT NULL DEFAULT '',
-                    next_retry_at TEXT NOT NULL DEFAULT '',
-                    dead_lettered_at TEXT NOT NULL DEFAULT '',
-                    status_code INTEGER,
-                    response_text TEXT NOT NULL DEFAULT '',
-                    last_error TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            self._ensure_image_columns(conn)
+            if _events_table_exists(conn):
+                self._migrate_events_table(conn)
+            else:
+                self._create_events_table(conn)
             self._ensure_indexes(conn)
-            self._migrate_legacy_failed_statuses(conn)
-            self._migrate_existing_images(conn)
-            self._rename_existing_image_files(conn)
 
     def add_event(
         self,
@@ -207,9 +201,8 @@ class EventStore:
             )
             return int(cursor.lastrowid)
 
-    def claim_ready_event(self, event_id: int) -> dict[str, Any] | None:
-        """原子地把待发送或到期待重试记录抢占为 sending，并返回最新记录。"""
-        now = iso_now()
+    def mark_send_started(self, event_id: int, first_attempt_at: str) -> bool:
+        """把有 payload 的记录标记为 sending，表示 worker 已开始 inline 发送。"""
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -220,67 +213,54 @@ class EventStore:
                         WHEN first_attempt_at = '' THEN ?
                         ELSE first_attempt_at
                     END,
-                    last_attempt_at = ?,
-                    next_retry_at = '',
+                    last_attempt_at = '',
                     dead_lettered_at = '',
+                    status_code = NULL,
+                    response_text = '',
                     last_error = ''
-                WHERE id = ?
-                  AND partner_payload_json NOT IN ('', '{}')
-                  AND (
-                    status = 'pending'
-                    OR (status = 'failed_retryable' AND next_retry_at != '' AND next_retry_at <= ?)
-                  )
+                WHERE id = ? AND partner_payload_json NOT IN ('', '{}')
                 """,
-                (now, now, now, event_id, now),
+                (first_attempt_at, first_attempt_at, event_id),
             )
-            if cursor.rowcount <= 0:
-                return None
-            row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-            return dict(row) if row is not None else None
+            return cursor.rowcount > 0
 
-    def record_send_request(
-        self, event_id: int, request_url: str, payload: dict[str, object]
-    ) -> None:
-        """记录系统实际准备发出的 API 请求。"""
-        payload_json = json.dumps(payload, ensure_ascii=False)
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE events
-                SET updated_at = ?, partner_payload_json = ?, last_request_url = ?,
-                    last_request_payload_json = ?
-                WHERE id = ?
-                """,
-                (iso_now(), payload_json, request_url, payload_json, event_id),
-            )
-
-    def update_send_result(
+    def finish_send_result(
         self,
         event_id: int,
         result: SendResult,
-        next_retry_at: str | None = None,
+        request_url: str,
+        payload: dict[str, object],
+        first_attempt_at: str,
+        last_attempt_at: str,
     ) -> None:
-        """根据本次发送结果把记录写成 sent、failed_retryable 或 dead_letter。"""
-        now = iso_now()
-        status = "sent" if result.success else ("failed_retryable" if next_retry_at else "dead_letter")
-        dead_lettered_at = now if status == "dead_letter" else ""
+        """写入当前 worker 内全部重试后的最终发送结果。"""
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        status = "sent" if result.success else "dead_letter"
+        dead_lettered_at = "" if result.success else iso_now()
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 UPDATE events
-                SET status = ?, updated_at = ?, attempts = ?, next_retry_at = ?,
-                    dead_lettered_at = ?, status_code = ?, response_text = ?, last_error = ?
+                SET status = ?, updated_at = ?, attempts = ?, first_attempt_at = ?,
+                    last_attempt_at = ?, dead_lettered_at = ?,
+                    status_code = ?, response_text = ?, last_error = ?,
+                    partner_payload_json = ?, last_request_url = ?,
+                    last_request_payload_json = ?
                 WHERE id = ?
                 """,
                 (
                     status,
-                    now,
+                    iso_now(),
                     result.attempts,
-                    next_retry_at or "",
+                    first_attempt_at,
+                    last_attempt_at,
                     dead_lettered_at,
                     result.status_code,
                     result.response_text,
                     "" if result.success else result.error,
+                    payload_json,
+                    request_url,
+                    payload_json,
                     event_id,
                 ),
             )
@@ -310,8 +290,8 @@ class EventStore:
                         WHEN image_data IS NULL THEN 0
                         ELSE length(image_data)
                     END AS image_size,
-                    attempts, first_attempt_at, last_attempt_at, next_retry_at,
-                    dead_lettered_at, status_code, response_text, last_error
+                    attempts, first_attempt_at, last_attempt_at, dead_lettered_at,
+                    status_code, response_text, last_error
                 FROM events
                 {where_sql}
                 ORDER BY id DESC
@@ -381,46 +361,6 @@ class EventStore:
             row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
             return dict(row) if row is not None else None
 
-    def list_ready_event_ids(self, limit: int = 300) -> list[int]:
-        """返回当前可发送记录 ID，包括 pending 和到期待重试记录。"""
-        now = iso_now()
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id
-                FROM events
-                WHERE partner_payload_json NOT IN ('', '{}')
-                  AND (
-                    status = 'pending'
-                    OR (status = 'failed_retryable' AND next_retry_at != '' AND next_retry_at <= ?)
-                  )
-                ORDER BY
-                    CASE
-                        WHEN status = 'pending' THEN received_at
-                        ELSE next_retry_at
-                    END ASC,
-                    id ASC
-                LIMIT ?
-                """,
-                (now, limit),
-            ).fetchall()
-            return [int(row["id"]) for row in rows]
-
-    def recover_stale_sending(self, stale_seconds: float) -> int:
-        """把长时间停留在 sending 的记录改为 failed_retryable 并立即允许重试。"""
-        cutoff = iso_seconds_ago(stale_seconds)
-        now = iso_now()
-        with self._lock, self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE events
-                SET status = 'failed_retryable', updated_at = ?, next_retry_at = ?, dead_lettered_at = ''
-                WHERE status = 'sending' AND updated_at < ?
-                """,
-                (now, now, cutoff),
-            )
-            return int(cursor.rowcount)
-
     def set_manual_retry(self, event_id: int) -> bool:
         """把有 payload 的记录重置为 pending，并清空旧的重试和返回元数据。"""
         with self._lock, self._connect() as conn:
@@ -432,7 +372,6 @@ class EventStore:
                     attempts = 0,
                     first_attempt_at = '',
                     last_attempt_at = '',
-                    next_retry_at = '',
                     dead_lettered_at = '',
                     status_code = NULL,
                     response_text = '',
@@ -452,13 +391,27 @@ class EventStore:
                 UPDATE events
                 SET status = 'dead_letter',
                     updated_at = ?,
-                    next_retry_at = '',
                     dead_lettered_at = ?,
                     last_error = ?
                 WHERE id = ?
                 """,
                 (now, now, error, event_id),
             )
+
+    def reset_interrupted_send(self, event_id: int, error: str) -> bool:
+        """把关闭中断的 sending 记录恢复为 pending，避免未满四次就死信。"""
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE events
+                SET status = 'pending',
+                    updated_at = ?,
+                    last_error = ?
+                WHERE id = ? AND status = 'sending'
+                """,
+                (iso_now(), error, event_id),
+            )
+            return cursor.rowcount > 0
 
     def probe_database_health(self) -> bool:
         """执行轻量 SQLite 读写探针，供 /status 判断数据库是否可用。"""
@@ -511,15 +464,13 @@ class EventStore:
             ).fetchone()
 
         db_sizes = self._database_size_bytes()
-        failed_retryable_count = int(counts.get("failed_retryable", 0))
         dead_letter_count = int(counts.get("dead_letter", 0))
         return {
             "last_success_sent_at": (
                 str(last_success_row["updated_at"]) if last_success_row is not None else ""
             ),
-            "failed_retryable_count": failed_retryable_count,
             "dead_letter_count": dead_letter_count,
-            "failure_backlog_count": failed_retryable_count + dead_letter_count,
+            "failure_backlog_count": dead_letter_count,
             **db_sizes,
         }
 
@@ -644,14 +595,6 @@ class EventStore:
                 return candidate
         return None
 
-    def _update_status(self, event_id: int, status: str) -> None:
-        """更新事件状态和更新时间。"""
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE events SET status = ?, updated_at = ? WHERE id = ?",
-                (status, iso_now(), event_id),
-            )
-
     def _connect(self) -> sqlite3.Connection:
         """创建 SQLite 连接，并启用适合长期运行的并发配置。"""
         conn = sqlite3.connect(
@@ -665,78 +608,47 @@ class EventStore:
         conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
-    def _ensure_image_columns(self, conn: sqlite3.Connection) -> None:
-        """为旧数据库补齐过车图片字段。"""
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()
-        }
-        if "image_name" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN image_name TEXT NOT NULL DEFAULT ''")
-        if "received_content_type" not in columns:
-            conn.execute(
-                "ALTER TABLE events ADD COLUMN received_content_type TEXT NOT NULL DEFAULT ''"
-            )
-        if "received_body_path" not in columns:
-            conn.execute(
-                "ALTER TABLE events ADD COLUMN received_body_path TEXT NOT NULL DEFAULT ''"
-            )
-        if "image_content_type" not in columns:
-            conn.execute(
-                "ALTER TABLE events ADD COLUMN image_content_type TEXT NOT NULL DEFAULT ''"
-            )
-        if "image_path" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN image_path TEXT NOT NULL DEFAULT ''")
-        if "image_data" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN image_data BLOB")
-        if "first_attempt_at" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN first_attempt_at TEXT NOT NULL DEFAULT ''")
-        if "last_attempt_at" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''")
-        if "next_retry_at" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN next_retry_at TEXT NOT NULL DEFAULT ''")
-        if "dead_lettered_at" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN dead_lettered_at TEXT NOT NULL DEFAULT ''")
-        if "status_code" not in columns:
-            conn.execute("ALTER TABLE events ADD COLUMN status_code INTEGER")
-        if "last_request_url" not in columns:
-            conn.execute(
-                "ALTER TABLE events ADD COLUMN last_request_url TEXT NOT NULL DEFAULT ''"
-            )
-        if "last_request_payload_json" not in columns:
-            conn.execute(
-                """
-                ALTER TABLE events
-                ADD COLUMN last_request_payload_json TEXT NOT NULL DEFAULT ''
-                """
-            )
-
     def _ensure_indexes(self, conn: sqlite3.Connection) -> None:
         """在字段补齐后创建查询性能依赖的索引。"""
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_status_id ON events(status, id)")
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_events_status_next_retry_id
-            ON events(status, next_retry_at, id)
-            """
-        )
+        if _index_exists(conn, "idx_events_status_id"):
+            return
+        conn.execute("CREATE INDEX idx_events_status_id ON events(status, id)")
+        LOGGER.info("database schema changed: created index idx_events_status_id")
 
-    def _migrate_legacy_failed_statuses(self, conn: sqlite3.Connection) -> None:
-        """把旧版本遗留的 failed 状态统一升级为 dead_letter。"""
-        now = iso_now()
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'dead_letter',
-                updated_at = ?,
-                next_retry_at = '',
-                dead_lettered_at = CASE
-                    WHEN dead_lettered_at = '' THEN ?
-                    ELSE dead_lettered_at
-                END
-            WHERE status = 'failed'
-            """,
-            (now, now),
+    def _create_events_table(self, conn: sqlite3.Connection) -> None:
+        """创建当前版本完整 events 表。"""
+        column_sql = ",\n                    ".join(
+            f"{name} {create_sql}" for name, create_sql, _add_sql in EVENT_TABLE_COLUMNS
         )
+        conn.execute(
+            f"""
+            CREATE TABLE events (
+                    {column_sql}
+            )
+            """
+        )
+        LOGGER.info("database schema changed: created events table")
+
+    def _migrate_events_table(self, conn: sqlite3.Connection) -> None:
+        """给旧 events 表补齐当前代码运行需要的缺失字段。"""
+        existing_columns = _events_table_columns(conn)
+        for core_column in {"id", "event_key"}:
+            if core_column not in existing_columns:
+                LOGGER.error("database schema migration failed: events table missing %s", core_column)
+                raise sqlite3.OperationalError(f"events table is missing required column: {core_column}")
+
+        for name, _create_sql, add_sql in EVENT_TABLE_COLUMNS:
+            if name in existing_columns:
+                continue
+            if not add_sql:
+                LOGGER.error("database schema migration failed: events table missing %s", name)
+                raise sqlite3.OperationalError(f"events table is missing required column: {name}")
+            conn.execute(f"ALTER TABLE events ADD COLUMN {name} {add_sql}")
+            LOGGER.info(
+                "database schema changed: added events.%s %s",
+                name,
+                add_sql,
+            )
 
     def _save_event_image(self, event: HikEvent) -> str:
         """把过车图片写入独立文件，并返回数据库中保存的路径文本。"""
@@ -771,90 +683,6 @@ class EventStore:
 
         row["image_size"] = file_size_or_zero(Path(image_path))
         return row
-
-    def _migrate_existing_images(self, conn: sqlite3.Connection) -> None:
-        """把旧数据库中仍存于 BLOB 的图片补写为独立文件。"""
-        rows = conn.execute(
-            """
-            SELECT id, event_key, image_name, image_content_type, image_data, event_time
-            FROM events
-            WHERE image_path = '' AND image_data IS NOT NULL
-            """
-        ).fetchall()
-        if not rows:
-            return
-        for row in rows:
-            target_dir = self._event_image_dir(str(row["event_time"] or ""))
-            target_dir.mkdir(parents=True, exist_ok=True)
-            image_path = target_dir / (
-                f"legacy_{row['id']}_{ascii_filename_part(row['event_key'])[:80]}"
-                f"{image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
-            )
-            image_path.write_bytes(row["image_data"])
-            conn.execute(
-                "UPDATE events SET image_path = ? WHERE id = ?",
-                (image_path.as_posix(), row["id"]),
-            )
-
-    def _rename_existing_image_files(self, conn: sqlite3.Connection) -> None:
-        """把旧图片文件名重命名为车牌、方向和时间戳更明确的格式。"""
-        rows = conn.execute(
-            """
-            SELECT id, image_path, image_content_type, image_name, plate_no, direction,
-                   event_time, event_key
-            FROM events
-            WHERE image_path != ''
-            """
-        ).fetchall()
-        for row in rows:
-            current_path = Path(row["image_path"])
-            if not current_path.exists():
-                continue
-            target_dir = self._event_image_dir(str(row["event_time"] or ""))
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target_name = (
-                f"{_event_image_filename_from_parts(row['plate_no'], row['direction'], row['event_time'])}"
-                f"{image_suffix_from_parts(row['image_content_type'], row['image_name'])}"
-            )
-            target_path = current_path
-            desired_path = target_dir / target_name
-            if current_path != desired_path:
-                target_path = unique_path(desired_path)
-                try:
-                    current_path.rename(target_path)
-                except OSError:
-                    target_path = current_path
-            conn.execute(
-                "UPDATE events SET image_path = ? WHERE id = ?",
-                (target_path.as_posix(), row["id"]),
-            )
-            self._update_payload_image_reference(conn, row["id"], target_path.as_posix())
-
-    def _update_payload_image_reference(
-        self, conn: sqlite3.Connection, event_id: int, image_path: str
-    ) -> None:
-        """把本地图片引用写入已有 payload 的 img 字段。"""
-        row = conn.execute(
-            "SELECT partner_payload_json FROM events WHERE id = ?",
-            (event_id,),
-        ).fetchone()
-        if row is None:
-            return
-
-        try:
-            payload = json.loads(row["partner_payload_json"] or "{}")
-        except json.JSONDecodeError:
-            return
-        if not isinstance(payload, dict) or not payload:
-            return
-
-        updated_payload = _payload_with_image_reference(payload, image_path)
-        if updated_payload == payload:
-            return
-        conn.execute(
-            "UPDATE events SET partner_payload_json = ? WHERE id = ?",
-            (json.dumps(updated_payload, ensure_ascii=False), event_id),
-        )
 
     def _delete_orphan_files(
         self,
@@ -1014,6 +842,29 @@ def load_partner_payload(
     if not isinstance(value, dict):
         raise ValueError("partner_payload_json is not an object")
     return _payload_with_image_reference(value, str(row.get("image_path") or ""), config)
+
+
+def _events_table_exists(conn: sqlite3.Connection) -> bool:
+    """判断当前 SQLite 库中是否已有 events 表。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+    ).fetchone()
+    return row is not None
+
+
+def _events_table_columns(conn: sqlite3.Connection) -> set[str]:
+    """读取 events 表已有字段名集合。"""
+    rows = conn.execute("PRAGMA table_info(events)").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _index_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """判断指定索引是否已经存在。"""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
 
 
 def _event_filter_where_clause(

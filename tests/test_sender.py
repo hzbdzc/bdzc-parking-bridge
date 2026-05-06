@@ -8,7 +8,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bdzc_parking.config import AppConfig
-from bdzc_parking.sender import PartnerClient
+from bdzc_parking.service import PartnerClient
 from helpers import free_tcp_port
 
 
@@ -68,7 +68,7 @@ def test_sender_interprets_partner_failure_without_retrying() -> None:
 def test_sender_url_error_logs_debug_not_warning(caplog) -> None:
     """底层 urllib 连接错误只作为 DEBUG 细节记录，业务结果由 service 汇总。"""
     port = free_tcp_port()
-    caplog.set_level(logging.DEBUG, logger="bdzc_parking.sender")
+    caplog.set_level(logging.DEBUG, logger="bdzc_parking.service")
     client = PartnerClient(
         AppConfig(
             partner_api_url=f"http://127.0.0.1:{port}/api",
@@ -79,7 +79,7 @@ def test_sender_url_error_logs_debug_not_warning(caplog) -> None:
     result = client.send_once({"car": "浙A0C547"})
 
     assert result.success is False
-    sender_records = [record for record in caplog.records if record.name == "bdzc_parking.sender"]
+    sender_records = [record for record in caplog.records if record.name == "bdzc_parking.service"]
     assert any(
         record.levelno == logging.DEBUG and "partner API URL error" in record.getMessage()
         for record in sender_records

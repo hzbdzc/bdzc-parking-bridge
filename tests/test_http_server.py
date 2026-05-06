@@ -55,11 +55,9 @@ def test_status_returns_business_health_and_worker_snapshot(tmp_path: Path) -> N
             assert response.status == 200
             assert payload["status"] == "ok"
             assert payload["db_ok"] is True
-            assert payload["queues"]["send"] == 0
-            assert payload["workers"]["send_total"] == 1
-            assert payload["workers"]["send_idle"] == 1
-            assert payload["workers"]["http_ingress_total"] == 1
-            assert payload["workers"]["maintenance_total"] == 1
+            assert payload["queues"]["service"] == 0
+            assert payload["workers"]["service_total"] == 3
+            assert payload["workers"]["service_idle"] == 3
             assert payload["http_server"]["lifecycle"]["state"] == "running"
             assert payload["http_server"]["lifecycle"]["process_alive"] is True
 
@@ -327,49 +325,77 @@ def test_request_child_stop_does_not_block_on_stuck_event(tmp_path: Path) -> Non
         manager.service.close()
 
 
-def test_parent_sentinel_force_exits_when_parent_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The child should force-exit after the parent process disappears."""
+def test_parent_sentinel_force_exits_when_parent_ends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child should force-exit quickly after the parent sentinel fires."""
 
     class FakeServer:
         """Server-like object exposing Uvicorn's should_exit flag."""
 
         should_exit = False
 
-    server = FakeServer()
-    exit_codes: list[int] = []
-    monkeypatch.setattr(http_server_module, "_PARENT_SENTINEL_CHECK_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(http_server_module, "_pid_exists", lambda pid: False)
+    class FakeParent:
+        """Parent-process test double whose sentinel has already fired."""
 
+        def join(self) -> None:
+            """Return immediately like a closed multiprocessing parent sentinel."""
+
+    server = FakeServer()
+    parent = FakeParent()
+    exit_codes: list[int] = []
+    monkeypatch.setattr(http_server_module.multiprocessing, "parent_process", lambda: parent)
+
+    started_at = time.monotonic()
     http_server_module._start_parent_sentinel_watcher(server, 999999, force_exit=exit_codes.append)
 
-    assert wait_until(lambda: exit_codes == [0], timeout_seconds=1.0)
+    assert wait_until(lambda: exit_codes == [0], timeout_seconds=0.2)
+    assert time.monotonic() - started_at < 0.2
     assert server.should_exit is False
 
 
 def test_parent_sentinel_ignores_already_exiting_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The sentinel should not poll the parent after Uvicorn is already exiting."""
+    """The sentinel should not force-exit after Uvicorn is already exiting."""
 
     class FakeServer:
         """Server-like object exposing Uvicorn's should_exit flag."""
 
         should_exit = True
 
-    checks: list[int] = []
+    class FakeParent:
+        """Parent-process test double whose sentinel has already fired."""
 
-    def fake_pid_exists(pid: int) -> bool:
-        """Record parent liveness checks."""
-        checks.append(pid)
-        return True
+        def __init__(self) -> None:
+            self.joined = threading.Event()
 
-    monkeypatch.setattr(http_server_module, "_PARENT_SENTINEL_CHECK_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(http_server_module, "_pid_exists", fake_pid_exists)
+        def join(self) -> None:
+            """Record that the sentinel watcher waited on this parent."""
+            self.joined.set()
 
+    parent = FakeParent()
+    exit_codes: list[int] = []
+    monkeypatch.setattr(http_server_module.multiprocessing, "parent_process", lambda: parent)
+
+    http_server_module._start_parent_sentinel_watcher(FakeServer(), 12345, force_exit=exit_codes.append)
+
+    assert parent.joined.wait(timeout=0.2)
+    assert exit_codes == []
+
+
+def test_parent_sentinel_does_nothing_without_multiprocessing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sentinel should quietly skip setup when multiprocessing exposes no parent."""
+
+    class FakeServer:
+        """Server-like object exposing Uvicorn's should_exit flag."""
+
+        should_exit = False
+
+    monkeypatch.setattr(http_server_module.multiprocessing, "parent_process", lambda: None)
     exit_codes: list[int] = []
 
     http_server_module._start_parent_sentinel_watcher(FakeServer(), 12345, force_exit=exit_codes.append)
     time.sleep(0.05)
 
-    assert checks == []
     assert exit_codes == []
 
 

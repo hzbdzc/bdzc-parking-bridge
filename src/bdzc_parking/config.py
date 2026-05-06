@@ -239,7 +239,7 @@ def _validate_external_url_base(value: str) -> None:
         raise ValueError("external_url_base 不能包含 query 或 fragment")
     path = parsed.path.rstrip("/")
     if path in {"", "/"}:
-        raise ValueError("external_url_base 必须包含明确的路径前缀，例如 https://host/parking-images")
+        raise ValueError("external_url_base 必须包含明确的路径前缀，例如 https://example.com/images")
 
 
 def _coerce_bool(value: Any) -> bool:

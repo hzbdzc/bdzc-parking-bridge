@@ -1,26 +1,23 @@
-﻿# 博达智创停车桥接程序
+# 博达智创停车桥接程序
 
-本项目用于接收海康威视停车终端上报的过车消息，转换为大园区停车系统 API 所需格式后发送。业务方向会反转：我方入口进场发送为大园区 `out`，我方出口出场发送为大园区 `in`。
+接收博达智创停车系统中海康威视终端上报的过车消息，解析后转换为大园区停车系统 API 请求并发送。业务方向按现场要求反转：我方进场发送为对方出场，我方出场发送为对方进场。
 
 ## 功能简介
 
-- 内置 Uvicorn/Starlette HTTP server，接收海康停车终端上报的过车消息。
-- 解析海康 multipart/JSON 报文，提取过车字段和图片。
-- 按规则过滤自动发送事件，支持车牌识别、停车触发和手动放行三类有效事件，跳过无车牌、无效事件类型、过车时间过旧等不需要自动发送的记录。
-- 对于车牌有效且方向可映射的记录，预生成大园区 API payload；即使默认跳过自动发送，仍可在详情里手动发送。
-- 自动发送采用持久化状态机 `pending / sending / failed_retryable / dead_letter / sent / skipped / parse_error`。
-- 自动发送失败后固定在 `1s / 5s / 10s` 后重试；第 4 次实际发送仍失败时转为 `dead_letter`，不再自动补发。
-- 支持配置 `external_url_base`，把 `img` 拼成外部可访问的图片 URL，并由内置 HTTP server 提供图片下载。
-- 图片下载按 IP 做令牌桶限流，避免外部反复刷图拖垮程序。
-- 发送链路使用固定后台 worker 和有界队列，避免下游 API 异常时线程数无限增长。
-- 提供最小运维接口：`GET /status` 返回健康状态、失败堆积、队列、数据库大小和 HTTP server 生命周期状态。
-- HTTP server 由主进程托管 Uvicorn 子进程；主进程进行存活/健康检测，发现异常时自动重启子进程。
-- SQLite 启用 WAL / busy timeout，并按保留期清理过期事件、图片和原始报文。
-- 使用 Qt GUI 控制 HTTP server、分页查看过车列表和详情、载入/导出配置、查看日志、执行模拟发送测试。
+- HTTP server 固定监听所有网卡，端口和接收路径由 `config.json` 控制。
+- 支持海康 multipart/JSON 过车消息解析，保存原始请求、原始 JSON、图片、大园区请求和发送结果。
+- 只自动发送符合条件的停车场出入口事件：`active`、方向为 `enter/exit`、`passingType` 为 `plateRecognition/stop/manual`、车牌有效、过车时间未超过配置的过旧阈值。
+- 发送失败后在当前 service worker 内按 `1 / 5 / 10` 秒等待重试；第 4 次仍失败则写入 `dead_letter`。
+- 当前事件状态为 `pending / sending / sent / dead_letter / skipped / parse_error`。
+- 不需要自动发送的记录会保存为 `skipped`，并保留跳过原因；有 payload 的记录可在 GUI 里手动重发。
+- HTTP server 由父进程托管 Uvicorn 子进程，提供 `/livez`、`/status` 和图片访问；父进程退出后 HTTP 子进程会自动退出。
+- service 层使用 3 个统一 worker 处理入站消息、发送、手动重发和清理任务；旧数据每小时自动清理，也可在 GUI 配置窗口手动触发。
+- SQLite 使用 WAL 和 busy timeout，数据库写入由 storage 层串行化。
+- GUI 支持开始/停止 HTTP server、查看记录详情、配置导入导出、模拟发送、手动重发、查看日志和清理旧数据。
 
 ## 运行方法
 
-先安装依赖：
+安装依赖：
 
 ```powershell
 uv sync
@@ -32,68 +29,51 @@ uv sync
 uv run bdzc_parking
 ```
 
-也可以用模块方式启动：
+也可以使用模块入口：
 
 ```powershell
 uv run python -m bdzc_parking
 ```
 
-Windows 下也可以直接双击项目根目录的 [start_bdzc_parking.bat](start_bdzc_parking.bat) 启动。
+Windows 现场可双击项目根目录的 [start_bdzc_parking.bat](start_bdzc_parking.bat)。该脚本会使用项目内 `config.json`，同步运行依赖，并启动无控制台窗口的 GUI。
 
-如果需要把历史 `data/raw_requests` 根目录文件整理到按日期划分的子目录，可执行：
+启动后在 GUI 顶部点击 `HTTP server` 开始监听；也可以把 `auto_start_server` 配置为 `true`，让程序启动时自动开启。
 
-```powershell
-.\migrate_raw_requests_by_date.bat
-```
+## 配置
 
-默认启动后在 GUI 中点击顶部 `HTTP server` 按钮开始监听，再让海康终端向本机监听地址上报消息；也可以在配置中启用 `auto_start_server`，让程序启动时自动开启 HTTP server。
+默认配置文件是项目根目录的 `config.json`，也可通过环境变量 `HKPARKING_CONFIG` 指定。
 
-GUI 关闭时会弹确认框。如果此时 HTTP server 正在运行，提示会明确说明退出将停止海康上报接收和外部图片访问。
+常用配置项：
+
+- `listen_port`、`listen_path`、`auto_start_server`：海康终端上报地址。
+- `partner_api_url`、`park_id`：大园区 API 地址和停车场 ID。
+- `local_entry_hobby/cid/cname`、`local_exit_hobby/cid/cname`：我方入口、出口映射到大园区 API 的通道信息。
+- `default_phone`：大园区 payload 默认手机号。
+- `external_url_base`：图片外部访问 URL 前缀；为空时 payload 中只保存图片文件名。
+- `request_timeout_seconds`：发送大园区 API 的单次请求超时。
+- `max_event_age_seconds`：过车时间相对接收时间超过该秒数时跳过自动发送。
+- `db_path`、`log_path`：SQLite 数据库和日志文件路径。
+
+日志默认写入 `logs/bdzc_parking.log`，超过 10MB 自动轮转，保留最近 5 个历史文件。
 
 ## 运维接口
 
-- `GET /`：纯文本存活响应，保持兼容旧探针和人工检查方式。
-- `GET /status`：JSON 状态接口；返回进程和 SQLite 健康状态、失败堆积数、队列长度、最近一次成功发送时间、数据库大小、`http_server.lifecycle`、`http_server.health` 和子进程指标。
+- `GET /livez`：只检查 HTTP 子进程本身是否存活。
+- `GET /status`：返回 HTTP 生命周期、service worker、队列、数据库健康、最近成功发送时间、死信积压和数据库大小。
+- 图片访问路径由 `external_url_base` 的 path 部分决定，例如 `https://example.com/parking-images` 对应 `/parking-images/<文件名>`。
 
-## 配置说明
+## 开发和测试
 
-配置文件 `config.json` 支持以下关键项：
-
-- `listen_port`、`listen_path`、`auto_start_server`
-- `partner_api_url`、`park_id`
-- `local_exit_hobby`、`local_exit_cid`、`local_exit_cname`：博达出口通道；车辆出博达园区、进入上园路时默认发送 `hobby: "in"`
-- `local_entry_hobby`、`local_entry_cid`、`local_entry_cname`：博达入口通道；车辆出上园路、进入博达园区时默认发送 `hobby: "out"`
-- `default_phone`、`external_url_base`
-- `request_timeout_seconds`、`max_event_age_seconds`
-- `db_path`、`log_path`
-
-其中：
-
-- `external_url_base` 为空时，`img` 保持图片文件名；非空时会变成完整 URL，例如 `https://host/parking-images/<文件名>`。
-- `external_url_base` 必须带明确 path 前缀，程序会把这个 path 前缀作为图片下载路由，例如 `https://host/parking-images` 对应 `/parking-images/<文件名>`。
-- 自动发送重试策略固定为 `1s / 5s / 10s`，不再由配置文件控制。
-- HTTP 容量、请求大小、图片限流、后台 worker、清理保留期和 GUI 分页大小使用代码内固定默认值，避免现场配置过多影响稳定性。
-
-GUI 配置窗口支持直接编辑当前活动配置、载入外部配置文件并立即应用、把当前配置导出到指定文件。鼠标悬浮每个配置项时会显示用途和生效说明。
-
-## 开发方法
-
-本项目使用 Python 3.14 和 uv 管理依赖。常用开发命令：
+安装开发依赖：
 
 ```powershell
 uv sync --dev
-uv run python -m bdzc_parking
-uv run python -m bdzc_parking.maintenance migrate-raw-requests
 ```
 
-核心业务入口在 [src/bdzc_parking/service.py](src/bdzc_parking/service.py)：HTTP server 收到消息后，服务层负责解析、过滤、入库、通知 GUI，并按持久化状态机调度待发送记录、重试记录和死信记录。
-
-## 测试方法
-
-运行全部测试：
+运行测试：
 
 ```powershell
-uv run python -m pytest
+uv run pytest
 ```
 
 语法编译检查：
@@ -102,47 +82,37 @@ uv run python -m pytest
 uv run python -m compileall -q src tests
 ```
 
-## 海康威视停车，出入口终端主机配置
+历史 raw request 文件按日期整理：
 
-程序的 HTTP server 接收从海康威视出入口终端发送的 HTTP 消息。需要配置主机：
+```powershell
+uv run python -m bdzc_parking.maintenance migrate-raw-requests
+```
 
-- 登录出入口终端 web 界面
-- 参数配置 - 平台接入 - 远程主机，再点击“参数配置”按钮
-  - 平台接入方式：http 主机
-  - URL：`/park`
-  - 填入程序运行主机的 IP 地址和程序端口（默认 `1888`）
-  - 按需填入其他选项
-  - 点击保存
+## 海康终端配置
 
-如果要让外部系统访问保存的过车图片，需要再把 `external_url_base` 指向本程序可访问的地址；如果前面有反向代理，需要把相同 path 前缀转发到本程序。
+在海康出入口终端 Web 管理界面中配置远程 HTTP 主机：
 
-## 主程序源码
+- 平台接入方式：HTTP 主机
+- 地址：运行本程序的主机 IP
+- 端口：`listen_port`，默认 `1888`
+- URL：`listen_path`，默认 `/park`
 
-| 文件 | 说明 |
-| --- | --- |
-| [src/bdzc_parking/__init__.py](src/bdzc_parking/__init__.py) | 包版本和导出信息 |
-| [src/bdzc_parking/__main__.py](src/bdzc_parking/__main__.py) | `python -m bdzc_parking` 的模块入口 |
-| [src/bdzc_parking/app.py](src/bdzc_parking/app.py) | 组装配置、日志配置、数据库、发送客户端、业务服务、HTTP server 和 GUI |
-| [src/bdzc_parking/common.py](src/bdzc_parking/common.py) | 跨模块共享的纯工具函数，包含时间、JSON 展示、文件名、路径和图片 part 判断等无业务状态操作 |
-| [src/bdzc_parking/config.py](src/bdzc_parking/config.py) | 应用配置默认值、JSON 配置文件读取、字段类型转换和保存 |
-| [src/bdzc_parking/gui.py](src/bdzc_parking/gui.py) | PySide6 GUI，负责 HTTP server 控制、过车列表、右侧详情面板、配置弹窗、模拟发送测试和手动发送 |
-| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 主进程托管 Uvicorn 子进程的海康消息接收 HTTP server、`/status` 运维接口、图片访问路由、请求限流和生命周期状态 |
-| [src/bdzc_parking/models.py](src/bdzc_parking/models.py) | `HikEvent`、`HikEventImage`、`SendResult` 等跨模块数据模型，以及事件过滤和海康到大园区 payload 的方向反转映射 |
-| [src/bdzc_parking/maintenance.py](src/bdzc_parking/maintenance.py) | 一次性维护命令入口，负责执行历史 `raw_requests` 文件按日期整理等工具动作 |
-| [src/bdzc_parking/parser.py](src/bdzc_parking/parser.py) | 海康 multipart/JSON 解析、过车字段提取和图片 part 提取 |
-| [src/bdzc_parking/sender.py](src/bdzc_parking/sender.py) | 大园区 API HTTP 客户端和响应解释；生产发送使用单次请求，重试由服务层状态机调度 |
-| [src/bdzc_parking/service.py](src/bdzc_parking/service.py) | 核心桥接流程：解析、过滤、入库、状态机发送、固定 1/5/10 秒补捞重试、手动发送和清理维护 |
-| [src/bdzc_parking/storage.py](src/bdzc_parking/storage.py) | SQLite 事件表、去重、图片保存、发送状态机元数据、保留期清理、运维统计和 payload 读取 |
+如果大园区需要访问过车图片，需要配置 `external_url_base`，并确保该地址能访问到本程序的 HTTP server 或前置反向代理。
 
-## 测试源码
+## 源码说明
 
 | 文件 | 说明 |
 | --- | --- |
-| [tests/test_config.py](tests/test_config.py) | 配置文件加载、导入导出、URL 校验和字段类型转换测试 |
-| [tests/test_http_server.py](tests/test_http_server.py) | 图片下载路由、限流、请求体大小保护、生命周期状态和 `/status` 接口测试 |
-| [tests/test_maintenance.py](tests/test_maintenance.py) | 维护命令入口和历史 `raw_requests` 文件整理输出测试 |
-| [tests/test_mapper.py](tests/test_mapper.py) | 过车事件过滤和方向反转映射测试 |
-| [tests/test_parser.py](tests/test_parser.py) | 海康消息样本解析、关键字段提取和图片提取测试 |
-| [tests/test_sender.py](tests/test_sender.py) | 大园区 API 发送、响应解释和重试逻辑测试 |
-| [tests/test_service.py](tests/test_service.py) | skipped 记录生成 payload、固定 1/5/10 秒状态机重试、死信和动态图片 URL 测试 |
-| [tests/test_storage.py](tests/test_storage.py) | 事件入库、图片保存、payload 图片引用、旧库迁移和列表轻量读取测试 |
+| [src/bdzc_parking/app.py](src/bdzc_parking/app.py) | 程序组装入口：加载配置、初始化日志、创建数据库、service、HTTP server 和 GUI。 |
+| [src/bdzc_parking/config.py](src/bdzc_parking/config.py) | 配置模型、默认值、JSON 读写、类型转换和校验。 |
+| [src/bdzc_parking/common.py](src/bdzc_parking/common.py) | 跨模块复用的纯工具函数。 |
+| [src/bdzc_parking/gui.py](src/bdzc_parking/gui.py) | PySide6 图形界面，负责展示、配置、模拟发送、手动重发和操作入口。 |
+| [src/bdzc_parking/http_server.py](src/bdzc_parking/http_server.py) | 入站 HTTP 层，托管 Uvicorn 子进程、接收海康消息、提供探针和图片访问。 |
+| [src/bdzc_parking/service.py](src/bdzc_parking/service.py) | 核心业务编排和大园区 API 客户端：消费入站队列、解析、过滤、入库、发送、重试、死信和清理。 |
+| [src/bdzc_parking/storage.py](src/bdzc_parking/storage.py) | SQLite 持久化边界，负责事件、附件、状态、查询、健康探针和数据清理。 |
+| [src/bdzc_parking/parser.py](src/bdzc_parking/parser.py) | 海康 multipart/JSON 请求解析和标准事件提取。 |
+| [src/bdzc_parking/models.py](src/bdzc_parking/models.py) | 共享数据结构、过滤规则和大园区 payload 映射逻辑。 |
+| [src/bdzc_parking/maintenance.py](src/bdzc_parking/maintenance.py) | 一次性维护命令入口。 |
+| [src/bdzc_parking/__main__.py](src/bdzc_parking/__main__.py) | `python -m bdzc_parking` 入口。 |
+
+参考资料在 `references/`，海康样本消息在 `references/hik_events/`。

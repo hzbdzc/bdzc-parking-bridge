@@ -53,7 +53,6 @@ _SERVER_START_TIMEOUT_SECONDS = 5.0
 _SERVER_STOP_GRACE_SECONDS = 1.0
 _SERVER_KILL_TIMEOUT_SECONDS = 1.0
 _SHUTDOWN_EVENT_SIGNAL_TIMEOUT_SECONDS = 0.2
-_PARENT_SENTINEL_CHECK_INTERVAL_SECONDS = 1.0
 _HEALTH_CHECK_INTERVAL_SECONDS = 10.0
 _HEALTH_CHECK_TIMEOUT_SECONDS = 3.0
 _HEALTH_FAILURE_THRESHOLD = 2
@@ -294,6 +293,15 @@ class BridgeHTTPServer:
             self._close_ipc_locked()
         LOGGER.info("HTTP server stopped")
 
+    def refresh(self, reason: str = "configuration changed") -> None:
+        """Restart the child process when the HTTP server is currently running."""
+        if not self.is_running:
+            LOGGER.info("HTTP server refresh skipped because it is not running: %s", reason)
+            return
+        LOGGER.info("HTTP server refresh requested: %s", reason)
+        self.stop()
+        self.start()
+
     def get_lifecycle_snapshot(self) -> dict[str, object]:
         """Return HTTP server lifecycle status for GUI and /status."""
         with self._lock:
@@ -495,7 +503,6 @@ class BridgeHTTPServer:
             "workers": runtime.get("workers", {}),
             "events": {
                 "last_success_sent_at": str(database.get("last_success_sent_at") or ""),
-                "failed_retryable": database.get("failed_retryable_count"),
                 "dead_letter": database.get("dead_letter_count"),
                 "failure_backlog": database.get("failure_backlog_count"),
             },
@@ -686,7 +693,7 @@ class _ChildHTTPApp:
                 "server_port": self.server_port,
                 "process_pid": self.process_pid,
                 "parent_pid": self.parent_pid,
-                "parent_alive": _pid_exists(self.parent_pid),
+                "parent_alive": _multiprocessing_parent_alive(),
             }
         )
         return payload
@@ -740,7 +747,7 @@ class _ChildHTTPApp:
                 "server_port": self.server_port,
                 "process_pid": self.process_pid,
                 "parent_pid": self.parent_pid,
-                "parent_alive": _pid_exists(self.parent_pid),
+                "parent_alive": _multiprocessing_parent_alive(),
             }
         )
         merged = dict(parent_http)
@@ -1002,14 +1009,22 @@ def _start_parent_sentinel_watcher(
     force_exit: Callable[[int], None] = os._exit,
 ) -> None:
     """Start a daemon thread that force-exits the child when the parent disappears."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        LOGGER.debug("HTTP child parent sentinel unavailable for pid=%s", parent_pid)
+        return
+
     def watch() -> None:
-        """Poll parent process liveness and terminate immediately on orphaning."""
-        while not server.should_exit:
-            if not _pid_exists(parent_pid):
-                LOGGER.warning("HTTP child parent process pid=%s is gone; force exiting", parent_pid)
-                force_exit(0)
-                return
-            time.sleep(_PARENT_SENTINEL_CHECK_INTERVAL_SECONDS)
+        """Block on Python's parent sentinel and terminate immediately on orphaning."""
+        try:
+            parent.join()
+        except Exception:
+            LOGGER.debug("HTTP child parent sentinel failed", exc_info=True)
+            return
+        if server.should_exit:
+            return
+        LOGGER.warning("HTTP child parent process pid=%s is gone; force exiting", parent_pid)
+        force_exit(0)
 
     threading.Thread(target=watch, name="http-child-parent-sentinel", daemon=True).start()
 
@@ -1305,32 +1320,12 @@ def _coerce_int(value: object) -> int | None:
         return None
 
 
-def _pid_exists(pid: int) -> bool:
-    """Return whether a process id appears to exist."""
-    if pid <= 0:
+def _multiprocessing_parent_alive() -> bool:
+    """Return whether multiprocessing's parent sentinel still reports alive."""
+    parent = multiprocessing.parent_process()
+    if parent is None:
         return False
-    if pid == os.getpid():
-        return True
-    if os.name == "nt":
-        return _windows_pid_exists(pid)
     try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def _windows_pid_exists(pid: int) -> bool:
-    """Check whether a Windows process exists without sending signals."""
-    try:
-        import ctypes
+        return bool(parent.is_alive())
     except Exception:
         return False
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    handle = kernel32.OpenProcess(0x1000, False, int(pid))
-    if handle:
-        kernel32.CloseHandle(handle)
-        return True
-    return ctypes.get_last_error() == 5

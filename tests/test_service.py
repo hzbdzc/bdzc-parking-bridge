@@ -6,7 +6,6 @@ import json
 import logging
 import threading
 from dataclasses import replace
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -46,7 +45,7 @@ class CapturingClient:
 
 
 class FlakyClient:
-    """按失败次数控制返回结果，覆盖 failed_retryable 和 dead_letter 流转。"""
+    """按失败次数控制返回结果，覆盖 worker 内 inline 重试流转。"""
 
     def __init__(self, config: AppConfig, fail_until: int):
         self.config = config
@@ -196,10 +195,9 @@ def test_send_record_uses_latest_external_url_base(tmp_path: Path) -> None:
         service.close()
 
 
-def test_failed_event_sets_next_retry_after_first_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """首次发送失败后，记录应转为 failed_retryable 并写入下次重试时间。"""
-    monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (10.0, 20.0, 30.0))
-    monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
+def test_failed_event_retries_inline_then_succeeds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """首次发送失败后，应在同一 worker 内等待并重试到最终成功。"""
+    monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
 
     config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
@@ -209,20 +207,10 @@ def test_failed_event_sets_next_retry_after_first_failure(monkeypatch: pytest.Mo
 
     try:
         service.handle_request(HIKVISION_CONTENT_TYPE, body)
-        assert wait_until(
-            lambda: bool(store.list_events())
-            and store.list_events()[0]["status"] == "failed_retryable"
-            and store.list_events()[0]["attempts"] == 1
-        )
-
         row = store.list_events()[0]
-        assert row["status"] == "failed_retryable"
-        assert row["attempts"] == 1
-        assert row["next_retry_at"] != ""
-        next_retry_at = datetime.fromisoformat(str(row["next_retry_at"]))
-        last_attempt_at = datetime.fromisoformat(str(row["last_attempt_at"]))
-        assert 9 <= (next_retry_at - last_attempt_at).total_seconds() <= 11
-        assert client.attempts == [1]
+        assert row["status"] == "sent"
+        assert row["attempts"] == 2
+        assert client.attempts == [1, 2]
     finally:
         service.close()
 
@@ -232,7 +220,6 @@ def test_failed_event_retries_then_becomes_dead_letter(
 ) -> None:
     """四次总发送都失败后，记录应停止自动补发并转为 dead_letter。"""
     monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
-    monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
 
     config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
@@ -250,119 +237,145 @@ def test_failed_event_retries_then_becomes_dead_letter(
         row = store.list_events()[0]
         assert row["status"] == "dead_letter"
         assert row["attempts"] == 4
-        assert row["next_retry_at"] == ""
         assert row["dead_lettered_at"] != ""
         assert client.attempts == [1, 2, 3, 4]
     finally:
         service.close()
 
 
-def test_stale_sending_record_is_recovered_and_sent_again(
+def test_close_during_retry_restores_pending_without_dead_letter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """启动时卡在 sending 的旧记录应恢复为可重试并再次发送。"""
-    monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
-    monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(service_module, "_STALE_SENDING_SECONDS", 0.0)
+    """重试等待中关闭 service 时，不应把未满四次实际发送的记录写成死信。"""
+    monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (5.0, 5.0, 5.0))
 
     config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
+    client = FlakyClient(config, fail_until=99)
+    service = ParkingBridgeService(config, store, client)
     body = sample_body("20260412_063354_226439_body.bin")
 
-    bootstrap_client = CapturingClient(config)
-    bootstrap_service = ParkingBridgeService(config, store, bootstrap_client)
     try:
-        bootstrap_service.handle_request(HIKVISION_CONTENT_TYPE, body)
-        assert wait_until(lambda: bool(store.list_events()) and store.list_events()[0]["status"] == "sent")
+        assert service.enqueue_http_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(lambda: client.attempts == [1])
+
+        service.close()
+        row = store.list_events()[0]
+        assert row["status"] == "pending"
+        assert row["attempts"] == 0
+        assert row["dead_lettered_at"] == ""
+        assert "service stopped before retries completed" in row["last_error"]
     finally:
-        bootstrap_service.close()
-
-    row = store.list_events()[0]
-    with store._connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'sending', updated_at = ?, attempts = 1, next_retry_at = ''
-            WHERE id = ?
-            """,
-            ("2000-01-01T00:00:00", int(row["id"])),
-        )
-
-    recovery_client = CapturingClient(config)
-    recovery_service = ParkingBridgeService(config, store, recovery_client)
-    try:
-        assert wait_until(lambda: recovery_client.calls == 1)
-        recovered = store.get_event(int(row["id"]))
-        assert recovered is not None
-        assert recovered["status"] == "sent"
-        assert recovered["attempts"] == 2
-    finally:
-        recovery_service.close()
+        service.close()
 
 
-def test_runtime_snapshot_reports_single_idle_sender_worker(tmp_path: Path) -> None:
-    """运行快照应显示发送 worker 固定 1 个且空闲。"""
+def test_runtime_snapshot_reports_idle_service_workers(tmp_path: Path) -> None:
+    """运行快照应显示统一 service worker 固定 3 个且空闲。"""
     config = AppConfig()
     store = EventStore(tmp_path / "events.sqlite3")
     service = ParkingBridgeService(config, store, CapturingClient(config))
     try:
         snapshot = service.get_runtime_snapshot()
         workers = snapshot["workers"]
-        assert workers["send_total"] == 1
-        assert workers["send_alive"] == 1
-        assert workers["send_active"] == 0
-        assert workers["send_idle"] == 1
-        assert workers["http_ingress_alive"] == service_module._HTTP_INGRESS_WORKER_COUNT
-        assert workers["maintenance_alive"] == 1
+        assert workers["service_total"] == 3
+        assert workers["service_alive"] == 3
+        assert workers["service_active"] == 0
+        assert workers["service_idle"] == 3
     finally:
         service.close()
 
 
-def test_runtime_snapshot_reports_busy_sender_worker(tmp_path: Path) -> None:
-    """发送阻塞期间，运行快照应显示 sender worker 忙碌。"""
+def test_runtime_snapshot_reports_busy_service_worker(tmp_path: Path) -> None:
+    """发送阻塞期间，运行快照应显示 service worker 忙碌。"""
     config = AppConfig(max_event_age_seconds=10_000_000_000.0)
     store = EventStore(tmp_path / "events.sqlite3")
     client = BlockingClient(config)
     service = ParkingBridgeService(config, store, client)
     body = sample_body("20260412_063354_226439_body.bin")
     try:
-        service.handle_request(HIKVISION_CONTENT_TYPE, body)
+        assert service.enqueue_http_request(HIKVISION_CONTENT_TYPE, body)
         assert wait_until(client.started.is_set)
 
         workers = service.get_runtime_snapshot()["workers"]
-        assert workers["send_total"] == 1
-        assert workers["send_alive"] == 1
-        assert workers["send_active"] == 1
-        assert workers["send_idle"] == 0
+        assert workers["service_total"] == 3
+        assert workers["service_alive"] == 3
+        assert workers["service_active"] == 1
+        assert workers["service_idle"] == 2
     finally:
         client.release.set()
         service.close()
 
 
-def test_runtime_snapshot_reports_busy_maintenance_worker(
+def test_manual_cleanup_request_runs_and_resets_timer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """手动清理应投递到统一 worker，并重置下一次定时清理时间。"""
+    caplog.set_level(logging.INFO, logger="bdzc_parking.service")
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    service = ParkingBridgeService(config, store, CapturingClient(config))
+    calls: list[tuple[int, int]] = []
+
+    def fake_prune(event_days: int, artifact_days: int) -> dict[str, int]:
+        calls.append((event_days, artifact_days))
+        return {"events_deleted": 0, "artifacts_cleared": 0, "files_deleted": 0}
+
+    monkeypatch.setattr(store, "prune_old_data", fake_prune)
+    before_cleanup_at = service._next_cleanup_at
+    try:
+        assert service.request_cleanup("test")
+        assert wait_until(lambda: bool(calls))
+
+        snapshot = service.get_runtime_snapshot()
+        assert snapshot["cleanup"]["finished_at"] != ""
+        assert service._next_cleanup_at > before_cleanup_at
+        assert "cleanup finished reason=test" in caplog.text
+        assert "events_deleted" in caplog.text
+    finally:
+        service.close()
+
+
+def test_worker_pool_handles_new_ingress_while_one_worker_waits_to_retry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """维护线程执行补捞时，运行快照应显示 maintenance worker 忙碌。"""
-    monkeypatch.setattr(service_module, "_MAINTENANCE_INTERVAL_SECONDS", 0.01)
+    """一个 worker 等待重试时，其他 service worker 仍应能处理新入站消息。"""
+    monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.3, 0.01, 0.01))
+    config = AppConfig(max_event_age_seconds=10_000_000_000.0)
+    store = EventStore(tmp_path / "events.sqlite3")
+    client = FlakyClient(config, fail_until=1)
+    service = ParkingBridgeService(config, store, client)
+    body = sample_body("20260412_063354_226439_body.bin")
+    try:
+        assert service.enqueue_http_request(HIKVISION_CONTENT_TYPE, body)
+        assert wait_until(lambda: client.attempts == [1])
+
+        assert service.enqueue_http_request("application/json", b"{}")
+        assert wait_until(lambda: any(row["status"] == "parse_error" for row in store.list_events()))
+    finally:
+        service.close()
+
+
+def test_service_worker_recovers_after_cleanup_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """清理任务抛异常后，worker 应继续存活并能处理后续入站消息。"""
     config = AppConfig()
     store = EventStore(tmp_path / "events.sqlite3")
     service = ParkingBridgeService(config, store, CapturingClient(config))
     entered = threading.Event()
-    release = threading.Event()
 
-    def slow_schedule_pending_events() -> None:
+    def raising_cleanup(_task) -> None:
         entered.set()
-        release.wait(timeout=3)
+        raise RuntimeError("cleanup boom")
 
-    service._schedule_pending_events = slow_schedule_pending_events
+    monkeypatch.setattr(service, "_handle_cleanup_task", raising_cleanup)
     try:
-        service._maintenance_wakeup.set()
+        assert service._enqueue_task(service_module._CleanupTask("test"))
         assert wait_until(entered.is_set)
-        workers = service.get_runtime_snapshot()["workers"]
-        assert workers["maintenance_total"] == 1
-        assert workers["maintenance_alive"] == 1
-        assert workers["maintenance_active"] == 1
-        assert workers["maintenance_idle"] == 0
+        assert wait_until(lambda: "cleanup boom" in str(service.get_runtime_snapshot()["last_error"]))
+
+        assert service.enqueue_http_request("application/json", b"{}")
+        assert wait_until(lambda: any(row["status"] == "parse_error" for row in store.list_events()))
+        assert service.get_runtime_snapshot()["workers"]["service_alive"] == 3
     finally:
-        release.set()
         service.close()

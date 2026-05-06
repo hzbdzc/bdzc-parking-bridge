@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -62,17 +63,27 @@ def test_store_saves_event_image(tmp_path: Path) -> None:
     assert bytes.fromhex("ffd8") not in saved_body
 
     request_payload = {"car": event.plate_no, "img": image_path.name}
-    store.record_send_request(event_id, "https://example.test/api", request_payload)
-    requested = store.get_event(event_id)
-    assert requested is not None
-    assert requested["last_request_url"] == "https://example.test/api"
-    assert json.loads(requested["last_request_payload_json"]) == request_payload
+    first_attempt_at = "2026-04-12T06:33:55"
+    assert store.mark_send_started(event_id, first_attempt_at)
+    sending = store.get_event(event_id)
+    assert sending is not None
+    assert sending["status"] == "sending"
+    assert sending["first_attempt_at"] == first_attempt_at
 
-    store.update_send_result(event_id, SendResult(True, 1, 200, '{"status":200,"msg":"ok"}'))
+    store.finish_send_result(
+        event_id,
+        SendResult(True, 1, 200, '{"status":200,"msg":"ok"}'),
+        "https://example.test/api",
+        request_payload,
+        first_attempt_at,
+        "2026-04-12T06:33:56",
+    )
     sent = store.get_event(event_id)
     assert sent is not None
     assert sent["status"] == "sent"
     assert sent["status_code"] == 200
+    assert sent["last_request_url"] == "https://example.test/api"
+    assert json.loads(sent["last_request_payload_json"]) == request_payload
 
 
 def test_list_events_supports_pagination_and_total_count(tmp_path: Path) -> None:
@@ -170,32 +181,6 @@ def test_list_events_supports_gui_filters(tmp_path: Path) -> None:
     assert "status_code:200" in store.list_event_filter_values("return_info")
 
 
-def test_reopen_store_migrates_legacy_failed_to_dead_letter(tmp_path: Path) -> None:
-    """旧版本遗留的 failed 状态应在重新打开数据库时升级为 dead_letter。"""
-    body = sample_body("20260412_063354_226439_body.bin")
-    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
-    event = extract_event(raw)
-    db_path = tmp_path / "events.sqlite3"
-
-    store = EventStore(db_path)
-    event_id, _created = store.add_event(event, "pending", True, partner_payload={"car": event.plate_no})
-    with store._connect() as conn:
-        conn.execute(
-            """
-            UPDATE events
-            SET status = 'failed', updated_at = '2000-01-01T00:00:00'
-            WHERE id = ?
-            """,
-            (event_id,),
-        )
-
-    reopened = EventStore(db_path)
-    row = reopened.get_event(event_id)
-    assert row is not None
-    assert row["status"] == "dead_letter"
-    assert row["dead_lettered_at"] != ""
-
-
 def test_backup_database_and_reset_keeps_backup_and_allows_empty_reopen(tmp_path: Path) -> None:
     """备份并重置数据库后，备份保留旧记录，原路径可重新打开为空库。"""
     body = sample_body("20260412_063354_226439_body.bin")
@@ -215,58 +200,31 @@ def test_backup_database_and_reset_keeps_backup_and_allows_empty_reopen(tmp_path
     assert fresh_store.list_events() == []
 
 
-def test_open_legacy_database_without_retry_columns_succeeds(tmp_path: Path) -> None:
-    """旧数据库缺少 next_retry_at 等新字段时，初始化应先补列再建索引。"""
+def test_init_db_migrates_legacy_events_table(tmp_path: Path, caplog) -> None:
+    """旧库缺少当前字段时，初始化应补齐字段并写迁移日志。"""
     db_path = tmp_path / "legacy.sqlite3"
-
-    import sqlite3
-
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            """
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_key TEXT NOT NULL UNIQUE,
-                received_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                status TEXT NOT NULL,
-                auto_send INTEGER NOT NULL DEFAULT 0,
-                skip_reason TEXT NOT NULL DEFAULT '',
-                event_time TEXT NOT NULL DEFAULT '',
-                direction TEXT NOT NULL DEFAULT '',
-                passing_type TEXT NOT NULL DEFAULT '',
-                plate_no TEXT NOT NULL DEFAULT '',
-                gate_name TEXT NOT NULL DEFAULT '',
-                lane_name TEXT NOT NULL DEFAULT '',
-                raw_json TEXT NOT NULL DEFAULT '',
-                received_content_type TEXT NOT NULL DEFAULT '',
-                received_body_path TEXT NOT NULL DEFAULT '',
-                partner_payload_json TEXT NOT NULL DEFAULT '',
-                last_request_url TEXT NOT NULL DEFAULT '',
-                last_request_payload_json TEXT NOT NULL DEFAULT '',
-                image_name TEXT NOT NULL DEFAULT '',
-                image_content_type TEXT NOT NULL DEFAULT '',
-                image_path TEXT NOT NULL DEFAULT '',
-                image_data BLOB,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                status_code INTEGER,
-                response_text TEXT NOT NULL DEFAULT '',
-                last_error TEXT NOT NULL DEFAULT ''
-            )
-            """
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_key TEXT NOT NULL UNIQUE)"
         )
+        conn.execute("INSERT INTO events (event_key) VALUES ('legacy-event')")
 
-    reopened = EventStore(db_path)
-    with reopened._connect() as conn:
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()
-        }
-        indexes = {
-            row["name"] for row in conn.execute("PRAGMA index_list(events)").fetchall()
-        }
+    caplog.set_level(logging.INFO, logger="bdzc_parking.storage")
+    store = EventStore(db_path)
 
-    assert {"first_attempt_at", "last_attempt_at", "next_retry_at", "dead_lettered_at"} <= columns
-    assert "idx_events_status_next_retry_id" in indexes
+    row = store.list_events()[0]
+    with sqlite3.connect(db_path) as conn:
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(events)").fetchall()}
+        index_row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_status_id'"
+        ).fetchone()
+
+    assert row["event_key"] == "legacy-event"
+    assert "status" in columns
+    assert "last_error" in columns
+    assert index_row is not None
+    assert "database schema changed: added events.status" in caplog.text
+    assert "database schema changed: created index idx_events_status_id" in caplog.text
 
 
 def test_migrate_raw_request_files_by_date_moves_root_files_and_updates_database(tmp_path: Path) -> None:
