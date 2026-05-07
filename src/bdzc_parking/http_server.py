@@ -57,6 +57,7 @@ _HEALTH_CHECK_INTERVAL_SECONDS = 10.0
 _HEALTH_CHECK_TIMEOUT_SECONDS = 3.0
 _HEALTH_FAILURE_THRESHOLD = 2
 _STATUS_REQUEST_TIMEOUT_SECONDS = 2.0
+_INGRESS_ACK_TIMEOUT_SECONDS = 2.0
 _IPC_DRAIN_ENQUEUE_TIMEOUT_SECONDS = 1.0
 _REQUEST_COUNTER = 0
 _REQUEST_COUNTER_LOCK = threading.Lock()
@@ -85,6 +86,7 @@ class _IngressItem:
     body: bytes
     client_ip: str
     request_id: int | str
+    ack_sender: Any
 
 
 @dataclass
@@ -455,9 +457,17 @@ class BridgeHTTPServer:
             except queue.Empty:
                 continue
             except (EOFError, OSError):
+                LOGGER.exception("HTTP ingress IPC queue closed")
                 break
-            if not isinstance(item, _IngressItem):
+            except Exception:
+                LOGGER.exception("HTTP ingress IPC loop recovered from unexpected error")
+                self._parent_stop_event.wait(0.1)
                 continue
+            if not isinstance(item, _IngressItem):
+                LOGGER.warning("HTTP ingress IPC ignored unexpected item: %r", type(item).__name__)
+                continue
+
+            accepted = False
             try:
                 accepted = self.service.enqueue_http_request(
                     item.content_type,
@@ -468,9 +478,12 @@ class BridgeHTTPServer:
                     timeout=_IPC_DRAIN_ENQUEUE_TIMEOUT_SECONDS,
                 )
             except Exception:
-                accepted = False
-                LOGGER.exception("failed to forward inbound HTTP request")
+                LOGGER.exception("failed to forward inbound HTTP request request_id=%s", item.request_id)
+            finally:
+                _send_ingress_ack(item.ack_sender, accepted)
+
             if not accepted:
+                LOGGER.warning("HTTP ingress request rejected request_id=%s", item.request_id)
                 with self._lock:
                     self._ipc_dropped_count += 1
 
@@ -482,8 +495,24 @@ class BridgeHTTPServer:
             except queue.Empty:
                 continue
             except (EOFError, OSError):
+                LOGGER.exception("HTTP status IPC queue closed")
                 break
-            payload = self._build_status_payload(request_id)
+            except Exception:
+                LOGGER.exception("HTTP status IPC loop recovered from unexpected error")
+                self._parent_stop_event.wait(0.1)
+                continue
+            try:
+                payload = self._build_status_payload(request_id)
+            except Exception as exc:
+                LOGGER.exception("failed to build HTTP status payload request_id=%s", request_id)
+                payload = {
+                    "status": "error",
+                    "time": iso_now(),
+                    "db_ok": False,
+                    "message": f"parent status failed: {type(exc).__name__}: {exc}",
+                    "http_server": self.get_runtime_snapshot(),
+                    "_status_request_id": request_id,
+                }
             _put_nowait_drop_oldest(self._status_response_queue, payload)
 
     def _build_status_payload(self, request_id: str) -> dict[str, object]:
@@ -777,15 +806,30 @@ class _ChildHTTPApp:
         request.state.request_body_length = len(body)
         if len(body) != content_length:
             return _text_response(400, "Bad Request")
+        ack_receiver, ack_sender = multiprocessing.Pipe(duplex=False)
         item = _IngressItem(
             request.headers.get("content-type", ""),
             body,
             _client_ip(request),
             getattr(request.state, "request_id", "-"),
+            ack_sender,
         )
         try:
             self.ingress_queue.put_nowait(item)
         except queue.Full:
+            _close_connection(ack_receiver)
+            _close_connection(ack_sender)
+            self.stats.record_busy()
+            return _text_response(503, "Busy")
+        except Exception as exc:
+            _close_connection(ack_receiver)
+            _close_connection(ack_sender)
+            self._record_exception(request, exc)
+            return _text_response(503, "Busy")
+        accepted = await asyncio.to_thread(_wait_ingress_ack, ack_receiver)
+        _close_connection(ack_receiver)
+        _close_connection(ack_sender)
+        if not accepted:
             self.stats.record_busy()
             return _text_response(503, "Busy")
         return _text_response(200, "OK")
@@ -1261,6 +1305,37 @@ def _close_queue(queue_obj: Any) -> None:
             join_thread()
         except Exception:
             pass
+
+
+def _close_connection(connection: Any) -> None:
+    """Close a multiprocessing Connection-like object."""
+    close = getattr(connection, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _send_ingress_ack(ack_sender: Any, accepted: bool) -> None:
+    """Send the child process a parent-side ingress acceptance result."""
+    try:
+        ack_sender.send(bool(accepted))
+    except Exception:
+        LOGGER.warning("failed to send HTTP ingress ack", exc_info=True)
+    finally:
+        _close_connection(ack_sender)
+
+
+def _wait_ingress_ack(ack_receiver: Any) -> bool:
+    """Wait briefly for the parent process to accept an ingress request."""
+    try:
+        if not ack_receiver.poll(_INGRESS_ACK_TIMEOUT_SECONDS):
+            return False
+        return ack_receiver.recv() is True
+    except Exception:
+        LOGGER.warning("failed to receive HTTP ingress ack", exc_info=True)
+        return False
 
 
 def _queue_empty(queue_obj: Any) -> bool:

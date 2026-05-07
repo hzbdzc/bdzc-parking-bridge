@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
 import socket
 import threading
 import time
@@ -124,6 +125,77 @@ def test_post_request_is_enqueued_and_returns_before_business_finishes(tmp_path:
         server.service.enqueue_http_request = slow_enqueue
         assert _post_park(_server_port(server), b"{}") == 200
         assert wait_until(lambda: called)
+
+
+def test_post_returns_503_when_parent_rejects_ingress(tmp_path: Path) -> None:
+    """A child POST should not return 200 unless the parent accepts the task."""
+    with _bridge_server(tmp_path) as server:
+        server.service.enqueue_http_request = lambda *args, **kwargs: False
+
+        assert _post_park(_server_port(server), b"{}") == 503
+
+
+def test_post_returns_503_and_parent_ingress_survives_exception(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """Parent ingress exceptions should be logged and should not kill the thread."""
+    with _bridge_server(tmp_path) as server:
+        calls = 0
+
+        def flaky_enqueue(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("forced enqueue failure")
+            return True
+
+        server.service.enqueue_http_request = flaky_enqueue
+        caplog.set_level(logging.WARNING)
+
+        assert _post_park(_server_port(server), b"{}") == 503
+        assert _post_park(_server_port(server), b"{}") == 200
+        assert "failed to forward inbound HTTP request" in caplog.text
+
+
+def test_post_returns_503_when_parent_ack_times_out(tmp_path: Path) -> None:
+    """If the parent does not answer the ack pipe, the child must fail the POST."""
+    with _bridge_server(tmp_path) as server:
+        server._parent_stop_event.set()
+        assert wait_until(lambda: server._ingress_thread is not None and not server._ingress_thread.is_alive())
+
+        assert _post_park(_server_port(server), b"{}") == 503
+
+
+def test_status_parent_payload_exception_returns_error_and_loop_survives(
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """A parent-side status exception should become a 503 payload, not a dead thread."""
+    with _bridge_server(tmp_path) as server:
+        original_snapshot = server.service.get_runtime_snapshot
+        calls = 0
+
+        def flaky_snapshot():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("forced status failure")
+            return original_snapshot()
+
+        server.service.get_runtime_snapshot = flaky_snapshot
+        caplog.set_level(logging.ERROR)
+
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _open_url(_url(server, "/status"))
+        payload = json.loads(exc_info.value.read().decode("utf-8"))
+        assert exc_info.value.code == 503
+        assert payload["status"] == "error"
+        assert "parent status failed" in payload["message"]
+        assert "failed to build HTTP status payload" in caplog.text
+
+        with _open_url(_url(server, "/status")) as response:
+            assert response.status == 200
 
 
 def test_request_limits_reject_bad_payloads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
