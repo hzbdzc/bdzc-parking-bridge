@@ -14,6 +14,7 @@
 - service 层使用 3 个统一 worker 处理入站消息、发送、手动重发和清理任务；旧数据每小时自动清理，也可在 GUI 配置窗口手动触发。
 - SQLite 使用 WAL 和 busy timeout，数据库写入由 storage 层串行化。
 - GUI 支持开始/停止 HTTP server、查看记录详情、配置导入导出、模拟发送、手动重发、查看日志和清理旧数据。
+- Windows 运行期间会阻止系统自动休眠并保持屏幕常亮，程序退出后自动释放。
 
 ## 运行方法
 
@@ -38,6 +39,8 @@ uv run python -m bdzc_parking
 Windows 现场可双击项目根目录的 [start_bdzc_parking.bat](start_bdzc_parking.bat)。该脚本会使用项目内 `config.json`，同步运行依赖，并启动无控制台窗口的 GUI。
 
 启动后在 GUI 顶部点击 `HTTP server` 开始监听；也可以把 `auto_start_server` 配置为 `true`，让程序启动时自动开启。
+
+程序运行期间会请求 Windows 保持系统和屏幕唤醒，避免无人值守时自动睡眠或熄屏影响接收、发送和查看状态。该机制不修改系统电源计划，不能阻止用户主动睡眠、合盖、断电、屏保或硬盘关闭策略；硬盘关闭请在现场 Windows 电源选项中配置。
 
 ## 配置
 
