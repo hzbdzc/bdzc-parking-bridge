@@ -157,6 +157,7 @@ def ascii_filename_part(value: object) -> str:
             pieces.append(char)
         elif char in _FILENAME_TOKEN_MAP:
             pieces.append(_FILENAME_TOKEN_MAP[char])
+            pieces.append("_")
         else:
             pieces.append(f"u{ord(char):x}")
     normalized = "".join(pieces)

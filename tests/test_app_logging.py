@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import os
+import logging
 import time
 
-from bdzc_parking.app import RetentionRotatingFileHandler
+import bdzc_parking.logging_setup as logging_setup
+from bdzc_parking.logging_setup import RetentionRotatingFileHandler
+
+
+def test_log_default_rollover_limit_is_two_mb() -> None:
+    """默认日志轮转阈值应符合 AGENTS 中 2M 的要求。"""
+    assert logging_setup.LOG_MAX_BYTES == 2 * 1024 * 1024
 
 
 def test_log_rollover_uses_timestamp_and_prunes_older_than_retention(tmp_path) -> None:
@@ -38,3 +45,22 @@ def test_log_rollover_uses_timestamp_and_prunes_older_than_retention(tmp_path) -
     assert log_path.exists()
     assert not old_archive.exists()
     assert recent_archive.exists()
+
+
+def test_two_log_handlers_can_write_and_roll_over_same_file(tmp_path) -> None:
+    """父进程和 HTTP 子进程各自的 handler 指向同一文件时不应因占用失败。"""
+    log_path = tmp_path / "shared.log"
+    first = RetentionRotatingFileHandler(log_path, max_bytes=120, retention_days=180, encoding="utf-8")
+    second = RetentionRotatingFileHandler(log_path, max_bytes=120, retention_days=180, encoding="utf-8")
+    record = logging.LogRecord("test", logging.INFO, __file__, 1, "message %s", ("x" * 80,), None)
+    try:
+        first.emit(record)
+        second.emit(record)
+        first.emit(record)
+    finally:
+        first.close()
+        second.close()
+
+    assert log_path.exists()
+    assert any(path.name.startswith("shared.") and path.suffix == ".log" for path in tmp_path.iterdir())
+    assert (tmp_path / "shared.log.lock").exists()

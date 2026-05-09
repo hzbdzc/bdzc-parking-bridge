@@ -24,7 +24,7 @@ from bdzc_parking.common import (
     unique_path,
 )
 from bdzc_parking.config import AppConfig
-from bdzc_parking.models import HikEvent, SendResult
+from bdzc_parking.models import HikEvent, SendResult, has_partner_payload_inputs, map_to_partner_payload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -218,7 +218,8 @@ class EventStore:
                     status_code = NULL,
                     response_text = '',
                     last_error = ''
-                WHERE id = ? AND partner_payload_json NOT IN ('', '{}')
+                WHERE id = ?
+                  AND status = 'pending'
                 """,
                 (first_attempt_at, first_attempt_at, event_id),
             )
@@ -311,6 +312,43 @@ class EventStore:
             ).fetchone()
             return int(row["total"] if row is not None else 0)
 
+    def get_event_list_signature(
+        self,
+        limit: int = 300,
+        offset: int = 0,
+        filters: dict[str, object] | None = None,
+    ) -> tuple[int, tuple[tuple[int, str, str, int], ...]]:
+        """返回当前列表页的轻量版本签名，供 GUI 判断是否需要重建表格。"""
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        where_sql, params = _event_filter_where_clause(filters)
+        with self._lock, self._connect() as conn:
+            total_row = conn.execute(
+                f"SELECT count(*) AS total FROM events {where_sql}",
+                params,
+            ).fetchone()
+            rows = conn.execute(
+                f"""
+                SELECT id, updated_at, status, attempts
+                FROM events
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, safe_limit, safe_offset),
+            ).fetchall()
+        total = int(total_row["total"] if total_row is not None else 0)
+        page_signature = tuple(
+            (
+                int(row["id"]),
+                str(row["updated_at"] or ""),
+                str(row["status"] or ""),
+                int(row["attempts"] or 0),
+            )
+            for row in rows
+        )
+        return total, page_signature
+
     def list_event_filter_values(
         self,
         filter_key: str,
@@ -376,7 +414,8 @@ class EventStore:
                     status_code = NULL,
                     response_text = '',
                     last_error = ''
-                WHERE id = ? AND partner_payload_json NOT IN ('', '{}')
+                WHERE id = ?
+                  AND status != 'sending'
                 """,
                 (iso_now(), event_id),
             )
@@ -415,9 +454,17 @@ class EventStore:
 
     def probe_database_health(self) -> bool:
         """执行轻量 SQLite 读写探针，供 /status 判断数据库是否可用。"""
+        return bool(self.probe_database_health_detail()["ok"])
+
+    def probe_database_health_detail(self) -> dict[str, object]:
+        """执行 SQLite 健康探针，并区分短暂超时和真实数据库错误。"""
         if not self._lock.acquire(timeout=SQLITE_HEALTH_TIMEOUT_SECONDS):
             LOGGER.debug("database health probe timed out waiting for store lock")
-            return False
+            return {
+                "ok": False,
+                "kind": "timeout",
+                "message": "timed out waiting for store lock",
+            }
         try:
             conn = sqlite3.connect(
                 self.db_path,
@@ -435,12 +482,13 @@ class EventStore:
                     conn.execute("ROLLBACK")
             finally:
                 conn.close()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             LOGGER.debug("database health probe failed", exc_info=True)
-            return False
+            kind = "timeout" if _sqlite_error_is_timeout(exc) else "error"
+            return {"ok": False, "kind": kind, "message": str(exc)}
         finally:
             self._lock.release()
-        return True
+        return {"ok": True, "kind": "", "message": ""}
 
     def get_status_snapshot(self) -> dict[str, object]:
         """汇总 /status 所需的失败堆积、最近成功时间和数据库大小。"""
@@ -841,7 +889,45 @@ def load_partner_payload(
     value = json.loads(text)
     if not isinstance(value, dict):
         raise ValueError("partner_payload_json is not an object")
+    if not value and config is not None:
+        value = _partner_payload_from_row(row, config)
     return _payload_with_image_reference(value, str(row.get("image_path") or ""), config)
+
+
+def _partner_payload_from_row(row: dict[str, Any], config: AppConfig) -> dict[str, object]:
+    """在旧记录未预存 payload 时，按当前配置从数据库字段重建 payload。"""
+    event_time = str(row.get("event_time") or "").strip()
+    if not event_time:
+        return {}
+    try:
+        timestamp = int(datetime.fromisoformat(event_time).timestamp())
+    except ValueError:
+        return {}
+
+    event = HikEvent(
+        event_key=str(row.get("event_key") or ""),
+        event_type=str(row.get("event_type") or ""),
+        event_state=str(row.get("event_state") or ""),
+        direction=str(row.get("direction") or "").strip(),
+        passing_type=str(row.get("passing_type") or "").strip(),
+        plate_no=str(row.get("plate_no") or "").strip(),
+        event_time=event_time,
+        timestamp=timestamp,
+        gate_name=str(row.get("gate_name") or ""),
+        lane_name=str(row.get("lane_name") or ""),
+        lane_id=str(row.get("lane_id") or ""),
+        raw={},
+        image=None,
+    )
+    if not has_partner_payload_inputs(event):
+        return {}
+    return map_to_partner_payload(event, config)
+
+
+def _sqlite_error_is_timeout(exc: sqlite3.Error) -> bool:
+    """判断 SQLite 错误是否更像短暂锁等待超时。"""
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text or "timeout" in text
 
 
 def _events_table_exists(conn: sqlite3.Connection) -> bool:

@@ -9,7 +9,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -21,14 +20,13 @@ from bdzc_parking.storage import EventStore, load_partner_payload
 
 
 LOGGER = logging.getLogger(__name__)
-Listener = Callable[[int], None]
 _TASK_SENTINEL = object()
-_CLEANUP_INTERVAL_SECONDS = 3600.0
+_CLEANUP_INTERVAL_SECONDS = 3 * 3600.0
 _RETRY_DELAYS_SECONDS = (1.0, 5.0, 10.0)
 _SERVICE_WORKER_COUNT = 3
 _SERVICE_QUEUE_SIZE = 512
 _EVENT_RETENTION_DAYS = 180
-_ARTIFACT_RETENTION_DAYS = 30
+_ARTIFACT_RETENTION_DAYS = 180
 
 
 class PartnerClient:
@@ -93,13 +91,18 @@ class _CleanupTask:
 class ParkingBridgeService:
     """处理海康 HTTP 请求并驱动大园区同步。"""
 
-    def __init__(self, config: AppConfig, store: EventStore, client: PartnerClient):
+    def __init__(
+        self,
+        config: AppConfig,
+        store: EventStore,
+        client: PartnerClient,
+        *,
+        start_workers: bool = True,
+    ):
         """保存配置、事件存储和大园区 API 客户端，并启动统一 worker 池。"""
         self.config = config
         self.store = store
         self.client = client
-        self._listeners: list[Listener] = []
-        self._listeners_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._task_queue: queue.Queue[_HttpIngressTask | _ManualResendTask | _CleanupTask | object] = queue.Queue(
             maxsize=_SERVICE_QUEUE_SIZE
@@ -120,7 +123,8 @@ class ParkingBridgeService:
         self._send_ids_lock = threading.Lock()
         self._active_send_ids: set[int] = set()
 
-        self._start_workers()
+        if start_workers:
+            self._start_workers()
 
     def close(self) -> None:
         """停止 service worker；发送等待会通过 stop_event 尽快中断。"""
@@ -134,11 +138,6 @@ class ParkingBridgeService:
                 break
         for worker in self._workers:
             worker.join(timeout=2)
-
-    def add_listener(self, listener: Listener) -> None:
-        """注册事件变化监听器，供 GUI 刷新表格使用。"""
-        with self._listeners_lock:
-            self._listeners.append(listener)
 
     def handle_request(self, content_type: str, body: bytes, client_ip: str = "unknown") -> None:
         """同步处理一次海康 HTTP 消息，主要供测试和本地工具复用。"""
@@ -162,15 +161,27 @@ class ParkingBridgeService:
         task = _HttpIngressTask(content_type, bytes(body), client_ip, request_id)
         return self._enqueue_task(task, block=block, timeout=timeout, count_rejection=True)
 
-    def manual_resend(self, event_id: int) -> None:
+    def manual_resend(self, event_id: int) -> bool:
         """把可重发记录重置为待发送，并交给统一 service worker 处理。"""
+        row = self.store.get_event(event_id)
+        if row is None:
+            LOGGER.info("event %s does not exist", event_id)
+            return False
+        try:
+            payload = load_partner_payload(row, self.config)
+        except Exception:
+            LOGGER.exception("event %s cannot build partner payload for manual resend", event_id)
+            return False
+        if not payload:
+            LOGGER.info("event %s has no partner payload for manual resend", event_id)
+            return False
         if not self.store.set_manual_retry(event_id):
             LOGGER.info("event %s is not resendable", event_id)
-            return
-        self._notify(event_id)
+            return False
         if not self._enqueue_task(_ManualResendTask(event_id), count_rejection=True):
             self.store.mark_dead_letter(event_id, "service queue is full; manual resend was not scheduled")
-            self._notify(event_id)
+            return False
+        return True
 
     def request_cleanup(self, reason: str = "manual") -> bool:
         """投递一次手动旧数据清理任务，并重置下一次定时清理时间。"""
@@ -262,6 +273,10 @@ class ParkingBridgeService:
         """检查 SQLite 是否可正常响应，供 /status 健康状态使用。"""
         return self.store.probe_database_health()
 
+    def get_database_health(self) -> dict[str, object]:
+        """返回 SQLite 健康详情，供 /status 区分短暂超时和真实错误。"""
+        return self.store.probe_database_health_detail()
+
     def _start_workers(self) -> None:
         """启动固定数量的统一 service worker。"""
         for index in range(_SERVICE_WORKER_COUNT):
@@ -326,7 +341,6 @@ class ParkingBridgeService:
                 task.content_type,
                 task.body,
             )
-            self._notify(event_id)
             return
 
         can_send, skip_reason = should_forward(event, self.config, received_at)
@@ -358,7 +372,6 @@ class ParkingBridgeService:
             "yes" if can_send else "no",
             f" skip_reason={skip_reason}" if skip_reason else "",
         )
-        self._notify(event_id)
 
         if created and can_send:
             self._send_stored_record(event_id)
@@ -381,27 +394,23 @@ class ParkingBridgeService:
             except Exception as exc:
                 LOGGER.exception("failed to load partner payload for event %s", event_id)
                 self.store.mark_dead_letter(event_id, f"failed to load partner payload: {exc}")
-                self._notify(event_id)
                 return
 
             if not payload:
                 LOGGER.info("event %s has no partner payload; mark dead letter", event_id)
                 self.store.mark_dead_letter(event_id, "event has no partner payload")
-                self._notify(event_id)
                 return
 
             first_attempt_at = iso_now()
             if not self.store.mark_send_started(event_id, first_attempt_at):
                 LOGGER.info("event %s cannot be marked sending", event_id)
                 return
-            self._notify(event_id)
 
             result, last_attempt_at = self._send_payload_with_retries(event_id, payload)
             if result is None:
                 reason = "service stopped before retries completed"
                 if self.store.reset_interrupted_send(event_id, reason):
                     LOGGER.info("partner send aborted event_id=%s status=pending reason=%s", event_id, reason)
-                self._notify(event_id)
                 return
             self.store.finish_send_result(
                 event_id,
@@ -421,7 +430,6 @@ class ParkingBridgeService:
                 final_status,
                 text_or(result.error, "-"),
             )
-            self._notify(event_id)
         finally:
             self._clear_event_sending(event_id)
 
@@ -488,7 +496,7 @@ class ParkingBridgeService:
                 self._cleanup_active = False
 
     def _maybe_enqueue_cleanup(self) -> None:
-        """到达一小时间隔后投递清理任务，避免重复投递。"""
+        """到达三小时间隔后投递清理任务，避免重复投递。"""
         now = time.monotonic()
         with self._runtime_lock:
             if self._cleanup_active or self._cleanup_pending or now < self._next_cleanup_at:
@@ -524,16 +532,6 @@ class ParkingBridgeService:
             LOGGER.warning("service task queue is full; task rejected: %s", type(task).__name__)
             return False
         return True
-
-    def _notify(self, event_id: int) -> None:
-        """通知所有监听器某条事件记录发生变化。"""
-        with self._listeners_lock:
-            listeners = list(self._listeners)
-        for listener in listeners:
-            try:
-                listener(event_id)
-            except Exception:
-                LOGGER.exception("event listener failed")
 
     def _mark_worker_active(self, delta: int) -> None:
         """增减当前正在执行任务的 worker 数量。"""

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -44,12 +45,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bdzc_parking.app import rotate_current_log_file
 from bdzc_parking.common import json_loads_or_text, pretty_json_text, text_or
 from bdzc_parking.config import AppConfig
 from bdzc_parking.http_server import BridgeHTTPServer
+from bdzc_parking.logging_setup import rotate_current_log_file
 from bdzc_parking.models import HikEvent, SendResult, map_to_partner_payload
-from bdzc_parking.service import ParkingBridgeService, PartnerClient
+from bdzc_parking.service import PartnerClient
 from bdzc_parking.storage import EventStore, backup_database_and_reset, load_partner_payload
 
 
@@ -103,19 +104,19 @@ CONFIG_FIELD_LABELS = {
 }
 
 CONFIG_FIELD_TOOLTIPS = {
-    "listen_host": "HTTP server 固定监听所有网卡地址 0.0.0.0，海康终端只需要访问本机实际 IP。",
-    "listen_port": "海康终端向本程序回调时使用的端口；若程序正在监听，修改后需要停止并重新开始 HTTP server。",
-    "listen_path": "海康终端上报消息时访问的 URL 路径，例如 /park；修改后会立即影响后续请求。",
+    "listen_host": "HTTP server 固定监听所有网卡地址 0.0.0.0",
+    "listen_port": "海康终端向本程序回调时使用的端口；修改后需要重新开始 HTTP server。",
+    "listen_path": "海康终端上报消息时访问的 URL 路径，例如 /park",
     "auto_start_server": "勾选后，程序下次启动时会自动开始监听 HTTP server。",
     "partner_api_url": "大园区停车系统接收过车数据的 HTTP API 地址。",
-    "external_url_base": "图片对外访问的 URL 前缀，例如 https://example.com/images  保存后会立即影响后续生成的图片外链。",
+    "external_url_base": "图片对外访问的 URL 前缀，例如 https://example.com/images",
     "park_id": "发送给大园区 API 的停车场 ID。",
-    "local_exit_hobby": "博达出口车辆出博达园区、进入上园路时发送的大园区类型，通常为 in。",
-    "local_exit_cid": "博达出口通道 CID；车辆出博达园区、进入上园路时，发送 hobby=in。",
-    "local_exit_cname": "博达出口通道名称；车辆出博达园区、进入上园路时，发送 hobby=in。",
-    "local_entry_hobby": "博达入口车辆出上园路、进入博达园区时发送的大园区类型，通常为 out。",
-    "local_entry_cid": "博达入口通道 CID；车辆出上园路、进入博达园区时，发送 hobby=out。",
-    "local_entry_cname": "博达入口通道名称；车辆出上园路、进入博达园区时，发送 hobby=out。",
+    "local_exit_hobby": "博达出口、进入大园区时发送的 hobby，通常为in。",
+    "local_exit_cid": "博达出口通道 CID；",
+    "local_exit_cname": "博达出口通道名称；",
+    "local_entry_hobby": "博达入口、出大园区时发送的 hobby，通常为 out。",
+    "local_entry_cid": "博达入口通道 CID；",
+    "local_entry_cname": "博达入口通道名称；",
     "default_phone": "大园区 payload 中默认填充的手机号，模拟发送也会默认使用这个值。",
     "request_timeout_seconds": "向大园区 API 发起 HTTP 请求时的超时秒数，必须大于 0。",
     "max_event_age_seconds": "过车时间相对收到时间超过这个秒数时，自动跳过发送，但仍会保留记录。",
@@ -125,7 +126,22 @@ CONFIG_FIELD_TOOLTIPS = {
 
 READONLY_CONFIG_FIELDS = ("db_path", "log_path")
 OPTIONAL_CONFIG_FIELDS = {"external_url_base"}
-HTTP_REFRESH_CONFIG_KEYS = {"listen_port", "listen_path", "external_url_base"}
+HTTP_REFRESH_CONFIG_KEYS = {
+    "listen_port",
+    "listen_path",
+    "partner_api_url",
+    "external_url_base",
+    "park_id",
+    "default_phone",
+    "local_exit_hobby",
+    "local_exit_cid",
+    "local_exit_cname",
+    "local_entry_hobby",
+    "local_entry_cid",
+    "local_entry_cname",
+    "request_timeout_seconds",
+    "max_event_age_seconds",
+}
 
 DIRECTION_LABELS = {
     "enter": "我方入口进场",
@@ -163,10 +179,10 @@ EVENT_PAGE_SIZE = 500
 DEFAULT_EVENT_TABLE_WIDTHS = [70, 170, 110, 90, 120, 90, 110, 260]
 
 
-class BridgeSignals(QObject):
-    """把后台线程事件转换成 Qt 主线程可处理的信号。"""
+class AdminSignals(QObject):
+    """把后台管理任务结果转换成 Qt 主线程可处理的信号。"""
 
-    changed = Signal(int)
+    admin_finished = Signal(object, object)
 
 
 class MockSignals(QObject):
@@ -463,7 +479,7 @@ class ConfigDialog(QDialog):
         )
 
     def cleanup_old_data(self) -> None:
-        """确认后把旧数据清理任务投递给 service worker。"""
+        """确认后把旧数据清理任务投递给 HTTP 子进程。"""
         if self.cleanup_handler is None:
             return
         result = QMessageBox.warning(
@@ -471,7 +487,7 @@ class ConfigDialog(QDialog):
             "确认清理旧数据",
             (
                 "将按程序保留策略清理过期过车记录、请求原文、图片和孤儿文件。\n\n"
-                "清理任务会在后台 service worker 中执行，并重置下一次自动清理计时器。是否继续？"
+                "清理任务会在 HTTP 子进程中执行，并重置下一次自动清理计时器。是否继续？"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -496,7 +512,7 @@ class ConfigDialog(QDialog):
         QMessageBox.information(
             self,
             "已开始清理旧数据",
-            "清理任务已交给 service worker，下一次自动清理计时器已重置。",
+            "清理任务已交给 HTTP 子进程，下一次自动清理计时器已重置。",
         )
 
     def rotate_log_file(self) -> None:
@@ -777,7 +793,7 @@ class EventDetailPanel(QWidget):
         )
         self.current_event_id = event_id
         self.title_label.setText(f"过车详情 - ID {row.get('id', '')}")
-        self.resend_button.setEnabled(_has_partner_payload(row))
+        self.resend_button.setEnabled(_has_partner_payload(row, self.config_provider()))
         self._load_image(row)
         self._fill_info_table(row, received_http_scroll)
 
@@ -988,10 +1004,10 @@ class ImagePreviewDialog(QDialog):
 class MockSendDialog(QDialog):
     """手动构造过车信息并发送到大园区 API 的测试弹窗。"""
 
-    def __init__(self, service: ParkingBridgeService, parent: QWidget | None = None):
-        """绑定业务服务并创建 mock 测试表单。"""
+    def __init__(self, config: AppConfig, parent: QWidget | None = None):
+        """绑定配置并创建 mock 测试表单。"""
         super().__init__(parent)
-        self.service = service
+        self.config = config
         self.signals = MockSignals()
         self.signals.finished.connect(self._show_send_result)
 
@@ -1003,7 +1019,7 @@ class MockSendDialog(QDialog):
         """创建 mock 过车输入框、发送按钮和结果显示区域。"""
         form = QFormLayout()
 
-        self.api_url_field = QLineEdit(self.service.config.partner_api_url)
+        self.api_url_field = QLineEdit(self.config.partner_api_url)
         form.addRow("大园区 API", self.api_url_field)
 
         self.plate_field = QLineEdit("浙A12345")
@@ -1011,11 +1027,11 @@ class MockSendDialog(QDialog):
 
         self.direction_field = QComboBox()
         self.direction_field.addItem(
-            f"我方入口进场 -> 大园区 {self.service.config.local_entry_hobby}",
+            f"我方入口进场 -> 大园区 {self.config.local_entry_hobby}",
             "enter",
         )
         self.direction_field.addItem(
-            f"我方出口出场 -> 大园区 {self.service.config.local_exit_hobby}",
+            f"我方出口出场 -> 大园区 {self.config.local_exit_hobby}",
             "exit",
         )
         form.addRow("过车方向", self.direction_field)
@@ -1031,7 +1047,7 @@ class MockSendDialog(QDialog):
         event_time_row.addWidget(self.now_button)
         form.addRow("过车时间", event_time_row)
 
-        self.phone_field = QLineEdit(self.service.config.default_phone)
+        self.phone_field = QLineEdit(self.config.default_phone)
         form.addRow("手机号", self.phone_field)
 
         self.send_button = QPushButton("发送到大园区 API")
@@ -1094,8 +1110,8 @@ class MockSendDialog(QDialog):
             lane_id="mock",
             raw={"mock": True},
         )
-        payload = map_to_partner_payload(event, self.service.config)
-        payload["phone"] = self.phone_field.text().strip() or self.service.config.default_phone
+        payload = map_to_partner_payload(event, self.config)
+        payload["phone"] = self.phone_field.text().strip() or self.config.default_phone
         return payload
 
     def _mock_api_url(self) -> str:
@@ -1116,7 +1132,7 @@ class MockSendDialog(QDialog):
 
     def _send_payload(self, payload: dict[str, object], api_url: str) -> None:
         """在线程中用临时 API 地址发送 payload，避免阻塞 Qt 主界面。"""
-        mock_config = replace(self.service.config, partner_api_url=api_url)
+        mock_config = replace(self.config, partner_api_url=api_url)
         try:
             result = PartnerClient(mock_config).send_once(payload)
         except Exception as exc:
@@ -1183,13 +1199,11 @@ class MainWindow(QMainWindow):
     def __init__(
         self,
         http_server: BridgeHTTPServer,
-        service: ParkingBridgeService,
         store: EventStore,
     ):
         """绑定服务对象并初始化窗口控件和刷新定时器。"""
         super().__init__()
         self.http_server = http_server
-        self.service = service
         self.store = store
         self.last_selected_event_id: int | None = None
         self.current_page_index = 0
@@ -1199,14 +1213,14 @@ class MainWindow(QMainWindow):
         self.event_filters: dict[str, str] = {}
         self.filter_controls: dict[str, QWidget] = {}
         self._updating_filter_controls = False
-        self.signals = BridgeSignals()
+        self._event_list_signature: tuple[object, ...] | None = None
+        self.signals = AdminSignals()
         self.plate_filter_timer = QTimer(self)
         self.plate_filter_timer.setSingleShot(True)
         self.plate_filter_timer.setInterval(300)
         self.plate_filter_timer.timeout.connect(self._apply_filter_controls)
         # 后台线程不直接操作 Qt 控件，而是通过 signal 切回主线程刷新。
-        self.signals.changed.connect(lambda _event_id: self.refresh_table())
-        self._attach_service_listener()
+        self.signals.admin_finished.connect(self._handle_admin_task_finished)
         self._force_close = False
         self._tray_message_shown = False
         self.tray_icon: QSystemTrayIcon | None = None
@@ -1222,7 +1236,7 @@ class MainWindow(QMainWindow):
         self.refresh_timer.setInterval(1000)
         self.refresh_timer.timeout.connect(self._refresh_periodic)
         self.refresh_timer.start()
-        self.refresh_table()
+        self.refresh_table(force=True)
 
     def changeEvent(self, event) -> None:  # noqa: N802
         """窗口最小化时隐藏到系统托盘。"""
@@ -1247,7 +1261,6 @@ class MainWindow(QMainWindow):
         if self.tray_icon is not None:
             self.tray_icon.hide()
         self.http_server.stop()
-        self.service.close()
         super().closeEvent(event)
 
     def _setup_tray_icon(self) -> None:
@@ -1392,7 +1405,7 @@ class MainWindow(QMainWindow):
             self.filter_scroll.horizontalScrollBar().setValue
         )
         self.detail_panel = EventDetailPanel(
-            lambda: self.service.config,
+            lambda: self.http_server.config,
             self.manual_resend_selected,
         )
 
@@ -1426,18 +1439,18 @@ class MainWindow(QMainWindow):
         self._update_runtime_status_bar()
 
     def _build_runtime_status_bar(self) -> None:
-        """创建底部运行状态栏，集中显示 HTTP 和 worker 状态灯。"""
+        """创建底部运行状态栏，集中显示 HTTP 进程状态灯。"""
         self.runtime_status_dots: dict[str, QLabel] = {}
         self.runtime_status_labels: dict[str, QLabel] = {}
         container = QWidget()
         layout = QHBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        for key in ("http", "service"):
+        for key in ("http",):
             dot = QLabel()
             dot.setFixedSize(10, 10)
             label = QLabel()
-            label.setMinimumWidth(90 if key == "http" else 72)
+            label.setMinimumWidth(180)
             self.runtime_status_dots[key] = dot
             self.runtime_status_labels[key] = label
             layout.addWidget(dot)
@@ -1547,7 +1560,7 @@ class MainWindow(QMainWindow):
         self.event_filters = filters
         self.current_page_index = 0
         self.last_selected_event_id = None
-        self.refresh_table()
+        self.refresh_table(force=True, refresh_filters=True)
 
     def open_config_dialog(self) -> None:
         """点击配置按钮后打开配置编辑弹窗。"""
@@ -1559,30 +1572,78 @@ class MainWindow(QMainWindow):
             log_rotate_handler=self.rotate_log_file,
         )
         dialog.exec()
-        self.refresh_table()
+        self.refresh_table(force=True, refresh_filters=True)
         self._update_buttons()
 
     def request_cleanup_old_data(self) -> bool:
-        """请求 service worker 手动执行一次旧数据清理。"""
-        scheduled = self.service.request_cleanup("manual")
+        """请求 HTTP 子进程手动执行一次旧数据清理。"""
+        scheduled = self._submit_admin_task("cleanup", lambda: self.http_server.submit_cleanup("manual"))
         self._update_runtime_status_bar()
         return scheduled
+
+    def _submit_admin_task(self, kind: str, submitter: Callable[[], dict[str, object]]) -> bool:
+        """在后台线程提交 HTTP 管理任务，并轮询到最终状态。"""
+        try:
+            accepted = submitter()
+        except Exception as exc:
+            QMessageBox.warning(self, "HTTP 管理任务提交失败", str(exc))
+            return False
+
+        task_id = str(accepted.get("task_id") or "")
+        if not task_id:
+            QMessageBox.warning(self, "HTTP 管理任务提交失败", f"返回内容缺少 task_id: {accepted}")
+            return False
+
+        self.statusBar().showMessage(f"HTTP 管理任务已提交：{kind} {task_id}", 5000)
+        thread = threading.Thread(
+            target=self._watch_admin_task,
+            args=(kind, task_id),
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _watch_admin_task(self, kind: str, task_id: str) -> None:
+        """轮询 HTTP 子进程中的管理任务，结束后切回 Qt 主线程显示结果。"""
+        deadline = time.monotonic() + 180.0
+        result: dict[str, object] = {"task_id": task_id, "status": "failed", "error": "任务查询超时"}
+        try:
+            while time.monotonic() < deadline:
+                result = self.http_server.get_admin_task(task_id)
+                status = str(result.get("status") or "")
+                if status not in {"queued", "running"}:
+                    break
+                time.sleep(0.5)
+        except Exception as exc:
+            result = {"task_id": task_id, "status": "failed", "error": str(exc)}
+        self.signals.admin_finished.emit(kind, result)
+
+    def _handle_admin_task_finished(self, kind: object, result: object) -> None:
+        """显示 HTTP 管理任务的最终结果，并刷新列表。"""
+        result_dict = result if isinstance(result, dict) else {"status": "failed", "error": str(result)}
+        status = str(result_dict.get("status") or "failed")
+        title = "HTTP 管理任务完成" if status == "succeeded" else "HTTP 管理任务失败"
+        message = str(result_dict.get("message") or result_dict.get("error") or result_dict)
+        if status == "succeeded":
+            self.statusBar().showMessage(f"{kind}: {message}", 8000)
+        else:
+            QMessageBox.warning(self, title, message)
+        self.refresh_table(force=True, refresh_filters=True)
+        self._update_runtime_status_bar()
 
     def backup_and_start_new_database(self) -> Path:
         """备份当前数据库，并重建运行服务以启用同一路径的新空库。"""
         db_path = Path(self.http_server.config.db_path)
         was_running = _http_server_is_active(self.http_server.get_control_snapshot())
-        old_service = self.service
         old_store = self.store
 
         self.refresh_timer.stop()
         self.http_server.stop()
-        old_service.close()
         try:
             backup_path = backup_database_and_reset(db_path)
-            self._replace_runtime_service(EventStore(db_path))
+            self._replace_runtime_store(EventStore(db_path))
         except Exception:
-            self._replace_runtime_service(old_store)
+            self._replace_runtime_store(old_store)
             if was_running:
                 try:
                     self.http_server.start()
@@ -1594,7 +1655,7 @@ class MainWindow(QMainWindow):
         self.last_selected_event_id = None
         self.current_page_index = 0
         self.detail_panel.clear()
-        self.refresh_table()
+        self.refresh_table(force=True, refresh_filters=True)
         self._update_buttons()
         if was_running:
             try:
@@ -1605,24 +1666,14 @@ class MainWindow(QMainWindow):
         self.refresh_timer.start()
         return backup_path
 
-    def _replace_runtime_service(self, store: EventStore) -> None:
-        """用指定存储重建业务服务，并把 GUI 与 HTTP server 指向新服务。"""
+    def _replace_runtime_store(self, store: EventStore) -> None:
+        """用指定存储替换 GUI 查询边界。"""
         self.store = store
-        self.service = ParkingBridgeService(
-            self.http_server.config,
-            self.store,
-            PartnerClient(self.http_server.config),
-        )
-        self.http_server.service = self.service
-        self._attach_service_listener()
-
-    def _attach_service_listener(self) -> None:
-        """把当前业务服务的事件变化通知转发到 Qt 主线程。"""
-        self.service.add_listener(lambda event_id: self.signals.changed.emit(event_id))
+        self._event_list_signature = None
 
     def open_mock_dialog(self) -> None:
         """点击模拟发送按钮后打开手动发送测试弹窗。"""
-        dialog = MockSendDialog(self.service, self)
+        dialog = MockSendDialog(self.http_server.config, self)
         dialog.exec()
 
     def open_log_file(self) -> None:
@@ -1709,21 +1760,46 @@ class MainWindow(QMainWindow):
             f"第 {current_page} / {page_count} 页，共 {self.total_event_count} 条，每页 {EVENT_PAGE_SIZE} 条"
         )
 
-    def refresh_table(self) -> None:
-        """从数据库读取最新记录并刷新表格。"""
+    def refresh_table(self, *, force: bool = False, refresh_filters: bool = False) -> None:
+        """从数据库读取最新记录并刷新表格；列表未变化时跳过重建。"""
         selected_id = (
             self._selected_event_id()
             or self.last_selected_event_id
             or self.detail_panel.current_event_id
         )
         previous_detail_id = self.detail_panel.current_event_id
-        self.total_event_count = self.store.count_events(self.event_filters)
+
+        offset = self.current_page_index * EVENT_PAGE_SIZE
+        total_count, page_signature = self.store.get_event_list_signature(
+            limit=EVENT_PAGE_SIZE,
+            offset=offset,
+            filters=self.event_filters,
+        )
+        self.total_event_count = total_count
         max_page_index = max(0, _page_count(self.total_event_count, EVENT_PAGE_SIZE) - 1)
         if self.current_page_index > max_page_index:
             self.current_page_index = max_page_index
-        offset = self.current_page_index * EVENT_PAGE_SIZE
+            offset = self.current_page_index * EVENT_PAGE_SIZE
+            total_count, page_signature = self.store.get_event_list_signature(
+                limit=EVENT_PAGE_SIZE,
+                offset=offset,
+                filters=self.event_filters,
+            )
+            self.total_event_count = total_count
+
+        signature = (
+            tuple(sorted(self.event_filters.items())),
+            self.current_page_index,
+            total_count,
+            page_signature,
+        )
+        if refresh_filters:
+            self._refresh_filter_options()
+        if not force and self._event_list_signature == signature:
+            self._update_pagination_controls()
+            return
+
         rows = self.store.list_events(limit=EVENT_PAGE_SIZE, offset=offset, filters=self.event_filters)
-        self._refresh_filter_options()
         selected_after_refresh: int | None = None
         scroll_state = self._capture_table_scroll_state()
 
@@ -1764,6 +1840,7 @@ class MainWindow(QMainWindow):
             self._restore_table_scroll_state(scroll_state)
             self.table.blockSignals(signals_were_blocked)
 
+        self._event_list_signature = signature
         if selected_after_refresh is None:
             self.last_selected_event_id = None
             self.detail_panel.clear()
@@ -1813,8 +1890,11 @@ class MainWindow(QMainWindow):
         if event_id is None:
             QMessageBox.information(self, "手动发送", "请先选择一条记录")
             return
+        if not self.http_server.is_running:
+            QMessageBox.information(self, "手动发送", "HTTP server 未运行，请先开始 HTTP server 后再手动发送。")
+            return
         row = self.store.get_event(event_id)
-        if row is None or not _has_partner_payload(row):
+        if row is None or not _has_partner_payload(row, self.http_server.config):
             QMessageBox.information(self, "手动发送", "这条记录没有可发送的大园区请求")
             return
 
@@ -1834,7 +1914,7 @@ class MainWindow(QMainWindow):
         if confirm_result != QMessageBox.StandardButton.Yes:
             return
 
-        self.service.manual_resend(event_id)
+        self._submit_admin_task("resend", lambda: self.http_server.submit_resend(event_id))
 
     def _selected_event_id(self) -> int | None:
         """读取当前表格选中行对应的数据库记录 ID。"""
@@ -1893,17 +1973,16 @@ class MainWindow(QMainWindow):
         self.server_button.setEnabled(bool(control.get("button_enabled", True)))
 
     def _update_runtime_status_bar(self) -> None:
-        """刷新底部状态栏中的 HTTP 和 service worker 状态。"""
+        """刷新底部状态栏中的 HTTP 进程状态。"""
         if not hasattr(self, "runtime_status_labels"):
             return
         try:
             control = self.http_server.get_control_snapshot()
             lifecycle = self.http_server.get_lifecycle_snapshot()
-            runtime = self.service.get_runtime_snapshot()
+            runtime = self.http_server.get_runtime_snapshot()
         except Exception as exc:
             tooltip = str(exc)
             self._set_runtime_status_segment("http", "error", f"HTTP: 获取失败 {exc}", tooltip)
-            self._set_runtime_status_segment("service", "idle", "Service: -", tooltip)
             return
 
         tooltip = _runtime_status_bar_tooltip(control, lifecycle, runtime)
@@ -1946,24 +2025,13 @@ def _runtime_status_bar_segments(
     lifecycle: dict[str, object],
     runtime: dict[str, object],
 ) -> dict[str, dict[str, str]]:
-    """生成底部状态栏各段文本和状态灯级别。"""
-    workers = _dict_value(runtime, "workers")
-    queues = _dict_value(runtime, "queues")
+    """生成底部状态栏 HTTP 进程文本和状态灯级别。"""
     http_text = _http_runtime_text(control, lifecycle)
-    service_text = _worker_runtime_text(workers, "service")
-    service_queue = _int_value(queues, "service")
-    rejected_count = _int_value(queues, "service_rejected")
-    cleanup = _dict_value(runtime, "cleanup")
-    cleanup_active = bool(cleanup.get("active"))
     return {
         "http": {
             "text": f"HTTP: {http_text}",
             "severity": str(control.get("severity") or "idle"),
-        },
-        "service": {
-            "text": f"Service: {service_text} q={service_queue} rejected={rejected_count}",
-            "severity": "busy" if cleanup_active else _worker_runtime_severity(workers, "service"),
-        },
+        }
     }
 
 
@@ -1974,14 +2042,12 @@ def _runtime_status_bar_tooltip(
 ) -> str:
     """生成底部状态栏 tooltip，包含更完整的运行快照。"""
     detail = str(control.get("detail") or "")
+    health = _dict_value(runtime, "health")
     lines = [
         _runtime_status_bar_text(control, lifecycle, runtime),
         f"HTTP state: {lifecycle.get('state', '-')}",
         f"HTTP failure: {detail or '-'}",
-        f"Workers: {_dict_value(runtime, 'workers')}",
-        f"Queues: {_dict_value(runtime, 'queues')}",
-        f"Cleanup: {_dict_value(runtime, 'cleanup')}",
-        f"Errors: {_dict_value(runtime, 'errors')}",
+        f"HTTP health: {health}",
     ]
     return "\n".join(lines)
 
@@ -2003,32 +2069,6 @@ def _http_runtime_text(control: dict[str, object], lifecycle: dict[str, object])
     return " ".join(pieces)
 
 
-def _worker_runtime_text(workers: dict[str, object], prefix: str) -> str:
-    """把单类 worker 的 alive/total/active/idle 字段转换成显示文本。"""
-    alive = _int_value(workers, f"{prefix}_alive")
-    total = _int_value(workers, f"{prefix}_total")
-    active = _int_value(workers, f"{prefix}_active")
-    if total <= 0 or alive <= 0:
-        state = "停止"
-    elif active > 0:
-        state = "忙碌"
-    else:
-        state = "空闲"
-    return f"{alive}/{total} {state}"
-
-
-def _worker_runtime_severity(workers: dict[str, object], prefix: str) -> str:
-    """把 worker 运行状态转换成状态灯级别。"""
-    alive = _int_value(workers, f"{prefix}_alive")
-    total = _int_value(workers, f"{prefix}_total")
-    active = _int_value(workers, f"{prefix}_active")
-    if total <= 0 or alive <= 0:
-        return "error"
-    if active > 0:
-        return "busy"
-    return "ok"
-
-
 def _compact_status_detail(detail: str, limit: int = 120) -> str:
     """压缩状态栏中的故障详情，完整内容仍放在 tooltip。"""
     if len(detail) <= limit:
@@ -2040,14 +2080,6 @@ def _dict_value(data: dict[str, object], key: str) -> dict[str, object]:
     """从 dict 中安全读取嵌套 dict。"""
     value = data.get(key)
     return value if isinstance(value, dict) else {}
-
-
-def _int_value(data: dict[str, object], key: str) -> int:
-    """从 dict 中安全读取整数值。"""
-    try:
-        return int(data.get(key) or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _http_server_severity_color(severity: str) -> str:
@@ -2082,10 +2114,12 @@ def _http_config_changed(previous: AppConfig, current: AppConfig) -> bool:
     )
 
 
-def _has_partner_payload(row: dict[str, object]) -> bool:
-    """判断记录是否已经生成可手动发送的大园区 payload。"""
-    payload_text = str(row.get("partner_payload_json") or "").strip()
-    return payload_text not in {"", "{}"}
+def _has_partner_payload(row: dict[str, object], config: AppConfig | None = None) -> bool:
+    """判断记录是否能生成可手动发送的大园区 payload。"""
+    try:
+        return bool(load_partner_payload(row, config))
+    except Exception:
+        return False
 
 
 def _table_item(
@@ -2110,13 +2144,12 @@ def _page_count(total: int, page_size: int) -> int:
 
 def run_gui(
     http_server: BridgeHTTPServer,
-    service: ParkingBridgeService,
     store: EventStore,
 ) -> int:
     """创建并运行 Qt 应用主循环。"""
     app = QApplication([])
     app.setWindowIcon(_app_icon())
-    window = MainWindow(http_server, service, store)
+    window = MainWindow(http_server, store)
     window.show()
     return app.exec()
 
@@ -2140,22 +2173,7 @@ def _help_markdown() -> str:
 
 def _default_help_markdown() -> str:
     """返回帮助文件缺失时使用的内置 Markdown 内容。"""
-    return """# 博达智创-管委会停车桥接程序
-
-本程序接收海康威视停车终端上报的过车消息，解析车牌、方向、时间和图片后，按规则转换并发送给大园区停车系统。
-
-## 简要使用
-
-1. 在 **配置** 中确认监听端口、接收路径和大园区 API 地址。
-2. 点击顶部 **HTTP server** 按钮开始或停止监听；也可在配置中启用自动开启。
-3. 左侧查看过车列表，右侧查看详情、图片、接收 HTTP JSON 和发送 API 内容。
-4. 需要测试时点击 **模拟发送**；需要排查运行记录时点击 **查看日志**。
-5. 对默认跳过但已生成 payload 的记录，也可以在右侧详情点击 **手动发送**。
-
-## 作者
-
-陈哲达
-"""
+    return "（帮助信息来自 help.md）"
 
 
 def _readonly_text_edit(placeholder: str) -> QTextEdit:

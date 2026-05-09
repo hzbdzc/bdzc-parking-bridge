@@ -18,14 +18,15 @@
 - 用 Python 3.14 编写
 - 用 uv 管理依赖和环境
 - GUI 使用 PySide6，HTTP 发送使用标准库 urllib，数据持久化使用 SQLite
-- 关键步骤记录 log，log 文件超过 10M 自动轮转，保留最近 5 个历史文件
+- 关键步骤记录 log，log 文件超过 2M 自动轮转，保留最近180天日志文件。
 - 代码风格精简，不引入额外复杂度，减少模块之间依赖。
 - 每个源文件、每个函数都要有注释。程序的主要或者关键步骤也要写明注释
 - 当前程序通过 uv 或者 bat 文件启动；如需单独可拷贝运行包，需要后续增加并维护专门的打包配置
 
 # 需求描述
+- 程序需要长时间无人值守运行，能处理各种异常状况，不能crash
 - HTTP server 监听所有网卡地址，接收海康威视停车终端发送来的 multipart/JSON 过车消息，监听端口和路径由配置控制
-- 接收到消息后：解析字段，保存图片，生成大园区API并发送，写入 SQLite 数据库。保存原始消息、发送的API信息、图片等。
+- 接收到消息后：解析字段，保存图片，生成大园区API并发送，写入 SQLite 数据库（保留过车数据，以及发送的API消息等）。
 - 只自动发送符合条件的过车信息：
   - 停车场出入口事件
   - active 状态
@@ -39,7 +40,7 @@
 - 配置文件 `config.json` 可定义监听端口、接收路径、是否自动开启 HTTP server、大园区 API 地址、停车场 ID、出入口 hobby/cid/cname、默认手机号、请求超时、过旧跳过秒数、数据库路径和日志路径，等配置项。
 - Qt GUI 提供主要功能：
     - 开始、停止 HTTP server，打开配置页、模拟发送页、帮助页
-    - 状态栏显示 http server状态，service worker状态
+    - 状态栏显示 http server状态
     - 过车列表显示数据库 ID、过车时间、车牌、方向、通道、类型、状态/次数/原因、返回信息；隐藏表格控件自身的行号栏
     - 选中列表记录后，在右侧详情面板显示完整字段、跳过原因、接收 HTTP、发送给大园区 API 的请求原文、返回内容、过车图片、发送事件等信息。
     - 详情页可查看大图，并对有大园区 payload 的记录执行手动重发
@@ -48,7 +49,7 @@
 
 
 # 架构描述
-- `app.py` 是程序组装入口，负责加载配置、初始化日志、创建 `EventStore`、`PartnerClient`、`ParkingBridgeService`、`BridgeHTTPServer`，并把这些对象交给 GUI。业务逻辑不应写在 `app.py`。
+- `app.py` 是程序入口，负责加载配置、初始化日志、创建其他实例。
 - `common.py` 只放跨模块复用的纯工具函数，例如时间字符串、JSON 展示、文件名、路径和图片 part 判断。`common.py` 不应依赖 GUI、HTTP server、service、storage 或配置对象。
 - `config.py` 只负责配置模型、默认值、加载、保存和类型转换。其他模块读取 `AppConfig`，不要在业务模块里直接解析 `config.json`。
 - GUI 层在 `gui.py`，是独立的用户界面层。GUI 负责展示数据、响应用户操作、调用 HTTP server 的启动/停止、调用 service 的手动重发和查询 store 数据；GUI 不负责解析海康消息、不直接执行自动发送状态机、不直接拼装大园区 payload。
@@ -59,22 +60,22 @@
 - maintenance 层在 `maintenance.py`，是独立维护命令入口，复用配置、日志和 storage 的清理/维护能力，不依赖 GUI 和 HTTP server。
 - 主要依赖方向是：`app -> gui/http_server/service/storage/config`；`gui -> http_server/service/storage/config/common`；`http_server -> service/config/common`；`service -> parser/models/storage/config/common`；`storage -> models/config/common`。下层模块不应反向依赖 GUI、HTTP server 或 app。
 - 运行时 GUI 和 HTTP server 是并列组件，共享同一个 `ParkingBridgeService` 和 `EventStore`。GUI 可以停止/启动 HTTP server，也可以替换运行中的 store/service；替换时必须让 HTTP server 指向新的 service，避免 HTTP 入站请求写入旧数据库。
-- 自动发送是持久化状态机，不依赖 GUI 是否打开。GUI 只是观察和人工操作入口；HTTP server 只是入站入口；真正的状态推进发生在 service 后台 worker 和 storage 状态更新中。
 
 ## http_server.py
-- `http_server.py`，是独立的入站 HTTP 层。用一个单独进程管理 uvicorn 服务器（http进程）
-  - 接收海康终端上报消息。收到合法上报消息后,传输给 service 层队列处理。
+- `http_server.py`，是独立的入站 HTTP 层。用一个单独进程管理 uvicorn 服务器（http进程），并且在进程内处理消息和持久化记录。
+  - 接收海康终端上报消息。收到合法上报消息后,直接在进程里处理。
+  - 记录处理过程到数据库。保存图片和消息存档到硬盘。
   - 提供图片访问
-  - 提供API探针(/livez返回http服务本身的健康状态， /status 同时返回业务健康数据)
-  - 做请求大小/路径/header 限制和生命周期状态记录。
-- 有一个健康守护线程，定时探测：
-  - 进程是否存活，如果不存活，立刻抛弃旧进程，开启新http进程
-  - 如果/livez探针有问题，连续有问题两次以后，关闭旧进程（正常退出-等1秒-直接kill），开启新http进程
+  - 每3小时定时清理旧数据：超过180天的记录，图片等。
+  - 提供API探针(/status 返回进程健康状态)
+
+- 有一个健康守护线程：
+- 定时探测http进程是否存活，并正常工作。如果不正常(连续两次探测出问题)，立刻抛弃旧进程（发起关闭1秒后如果无响应，直接kill），开启新http进程
+
 
 
 ## service.py
-- `service.py`service 层，是核心业务编排层。它负责消费 HTTP 入站队列、调用 parser 解析海康消息、调用 models 判断是否发送和生成大园区 payload、调用 storage 入库、用内置 `PartnerClient` 发送大园区 API，并通知 GUI 刷新。
-- service的各个线程状态，有变量记录，GUI可以显示，以排查各个线程是否卡死。
+- `service.py`service 层，是核心业务编排层。它负责提供函数和方法处理和http消息、调用 storage 入库、用内置 `PartnerClient` 发送大园区 API。
 
 
 

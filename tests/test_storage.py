@@ -86,6 +86,52 @@ def test_store_saves_event_image(tmp_path: Path) -> None:
     assert json.loads(sent["last_request_payload_json"]) == request_payload
 
 
+def test_manual_retry_does_not_override_sending_record(tmp_path: Path) -> None:
+    """手动重发不应覆盖正在 sending 的记录。"""
+    body = sample_body("20260412_063354_226439_body.bin")
+    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
+    event = extract_event(raw)
+    store = EventStore(tmp_path / "events.sqlite3")
+
+    event_id, _ = store.add_event(
+        event,
+        "pending",
+        True,
+        partner_payload={"car": event.plate_no},
+    )
+
+    assert store.mark_send_started(event_id, "2026-04-12T06:33:55")
+    assert not store.set_manual_retry(event_id)
+
+    row = store.get_event(event_id)
+
+    assert row is not None
+    assert row["status"] == "sending"
+    assert row["first_attempt_at"] == "2026-04-12T06:33:55"
+
+
+def test_load_partner_payload_rebuilds_missing_payload_from_event_fields(tmp_path: Path) -> None:
+    """旧记录没有预存 payload 时，应能按当前配置从事件字段重建。"""
+    body = sample_body("20260412_063354_226439_body.bin")
+    raw = parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
+    event = extract_event(raw)
+    store = EventStore(tmp_path / "events.sqlite3")
+    event_id, _ = store.add_event(event, "skipped", False)
+
+    row = store.get_event(event_id)
+    assert row is not None
+    assert row["partner_payload_json"] == "{}"
+
+    payload = load_partner_payload(row, AppConfig())
+
+    assert payload["car"] == event.plate_no
+    assert payload["timestamp"] == str(event.timestamp)
+    assert payload["hobby"] == "out"
+    assert payload["img"]
+    assert store.set_manual_retry(event_id)
+    assert store.mark_send_started(event_id, "2026-04-12T06:33:55")
+
+
 def test_list_events_supports_pagination_and_total_count(tmp_path: Path) -> None:
     """事件列表应能按 ID 倒序分页读取，并提供总数。"""
     store = EventStore(tmp_path / "events.sqlite3")
@@ -116,6 +162,32 @@ def test_list_events_supports_pagination_and_total_count(tmp_path: Path) -> None
     assert first_page[-1]["id"] == 6
     assert second_page[0]["id"] == 5
     assert second_page[-1]["id"] == 1
+
+
+def test_event_list_signature_changes_when_visible_row_changes(tmp_path: Path) -> None:
+    """轻量列表签名应随当前页可见记录版本变化。"""
+    store = EventStore(tmp_path / "events.sqlite3")
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO events (event_key, received_at, updated_at, status, attempts)
+            VALUES ('event-1', '2026-04-12T06:33:55', '2026-04-12T06:33:55', 'pending', 0)
+            """
+        )
+
+    before = store.get_event_list_signature(limit=10)
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE events
+            SET status = 'sent', attempts = 1, updated_at = '2026-04-12T06:33:56'
+            WHERE event_key = 'event-1'
+            """
+        )
+    after = store.get_event_list_signature(limit=10)
+
+    assert before != after
+    assert after[0] == 1
 
 
 def test_list_events_supports_gui_filters(tmp_path: Path) -> None:

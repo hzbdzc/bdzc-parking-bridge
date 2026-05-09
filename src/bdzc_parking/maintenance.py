@@ -5,8 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from bdzc_parking.app import setup_logging
 from bdzc_parking.config import AppConfig
+from bdzc_parking.logging_setup import setup_logging
 from bdzc_parking.storage import EventStore
 
 

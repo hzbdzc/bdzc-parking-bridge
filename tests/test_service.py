@@ -195,6 +195,52 @@ def test_send_record_uses_latest_external_url_base(tmp_path: Path) -> None:
         service.close()
 
 
+def test_manual_resend_rebuilds_missing_partner_payload(tmp_path: Path) -> None:
+    """旧记录未预存 payload 时，手动重发应从字段重建后发送。"""
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    client = CapturingClient(config)
+    service = ParkingBridgeService(config, store, client)
+    body = sample_body("20260412_063354_226439_body.bin")
+    event = service_module.extract_event(
+        service_module.parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
+    )
+    event_id, _ = store.add_event(event, "skipped", False)
+
+    try:
+        row = store.get_event(event_id)
+        assert row is not None
+        assert row["partner_payload_json"] == "{}"
+
+        assert service.manual_resend(event_id)
+        assert wait_until(lambda: client.calls == 1)
+
+        assert client.payloads[0]["car"] == event.plate_no
+        sent = store.get_event(event_id)
+        assert sent is not None
+        assert sent["status"] == "sent"
+    finally:
+        service.close()
+
+
+def test_manual_resend_rejects_record_without_payload_inputs(tmp_path: Path) -> None:
+    """无法生成 payload 的记录应在入队前拒绝手动重发。"""
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    client = CapturingClient(config)
+    service = ParkingBridgeService(config, store, client)
+    event_id = store.add_parse_error("bad-record", "bad payload", "application/json", b"{}")
+
+    try:
+        assert not service.manual_resend(event_id)
+        assert client.calls == 0
+        row = store.get_event(event_id)
+        assert row is not None
+        assert row["status"] == "parse_error"
+    finally:
+        service.close()
+
+
 def test_failed_event_retries_inline_then_succeeds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """首次发送失败后，应在同一 worker 内等待并重试到最终成功。"""
     monkeypatch.setattr(service_module, "_RETRY_DELAYS_SECONDS", (0.01, 0.02, 0.03))
@@ -269,6 +315,33 @@ def test_close_during_retry_restores_pending_without_dead_letter(
         service.close()
 
 
+def test_service_startup_leaves_legacy_sending_record_unchanged(tmp_path: Path) -> None:
+    """Startup should not recover or resend sending records left by an old process."""
+    config = AppConfig()
+    store = EventStore(tmp_path / "events.sqlite3")
+    body = sample_body("20260412_063354_226439_body.bin")
+    event = service_module.extract_event(
+        service_module.parse_hikvision_payload(HIKVISION_CONTENT_TYPE, body)
+    )
+    event_id, _ = store.add_event(
+        event,
+        "pending",
+        True,
+        partner_payload={"car": event.plate_no},
+    )
+    assert store.mark_send_started(event_id, "2026-04-12T06:33:55")
+    client = CapturingClient(config)
+    service = ParkingBridgeService(config, store, client)
+    try:
+        row = store.get_event(event_id)
+        assert row is not None
+        assert row["status"] == "sending"
+        assert row["attempts"] == 0
+        assert client.calls == 0
+    finally:
+        service.close()
+
+
 def test_runtime_snapshot_reports_idle_service_workers(tmp_path: Path) -> None:
     """运行快照应显示统一 service worker 固定 3 个且空闲。"""
     config = AppConfig()
@@ -327,6 +400,7 @@ def test_manual_cleanup_request_runs_and_resets_timer(
         assert wait_until(lambda: bool(calls))
 
         snapshot = service.get_runtime_snapshot()
+        assert calls == [(180, 180)]
         assert snapshot["cleanup"]["finished_at"] != ""
         assert service._next_cleanup_at > before_cleanup_at
         assert "cleanup finished reason=test" in caplog.text
