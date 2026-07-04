@@ -6,7 +6,7 @@
 
 - HTTP server 固定监听所有网卡，端口和接收路径由 `config.json` 控制。
 - 支持海康 multipart/JSON 过车消息解析，保存原始请求、原始 JSON、图片、大园区请求和发送结果。
-- 只自动发送符合条件的停车场出入口事件：`active`、方向为 `enter/exit`、`passingType` 为 `plateRecognition/stop/manual`、车牌有效、过车时间未超过配置的过旧阈值。
+- 只自动发送符合条件的停车场出入口事件：`active`、方向为 `enter/exit`、车牌有效、过车时间未超过配置的过旧阈值；`passingType` 不参与拦截。
 - 发送失败后在当前 service worker 内按 `1 / 5 / 10` 秒等待重试；第 4 次仍失败则写入 `dead_letter`。
 - 当前事件状态为 `pending / sending / sent / dead_letter / skipped / parse_error`。
 - 不需要自动发送的记录会保存为 `skipped`，并保留跳过原因；有 payload 的记录可在 GUI 里手动重发。

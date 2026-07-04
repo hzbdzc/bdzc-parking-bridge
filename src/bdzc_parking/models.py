@@ -10,9 +10,6 @@ from bdzc_parking.common import format_seconds
 from bdzc_parking.config import AppConfig
 
 
-FORWARD_PASSING_TYPES = {"plateRecognition", "stop", "manual"}
-
-
 @dataclass(frozen=True)
 class HikEventImage:
     """从海康 multipart 消息中提取出的过车图片。"""
@@ -64,15 +61,13 @@ def should_forward(
     received_at: datetime | None = None,
 ) -> tuple[bool, str]:
     """判断海康事件是否应该发送给大园区，并返回跳过原因。"""
-    # 只处理停车场出入口的有效牌识过车事件，其他事件只入库展示。
+    # 只处理停车场出入口的有效过车事件，passingType 不参与拦截。
     if event.event_type != "vehiclePassingInParkingLot":
         return False, f"unsupported eventType: {event.event_type}"
     if event.event_state != "active":
         return False, f"unsupported eventState: {event.event_state}"
     if event.direction not in {"enter", "exit"}:
         return False, f"unsupported directionType: {event.direction}"
-    if event.passing_type not in FORWARD_PASSING_TYPES:
-        return False, f"unsupported passingType: {event.passing_type}"
     if not has_partner_payload_inputs(event):
         return False, "invalid plateNo"
     if config is not None and received_at is not None:

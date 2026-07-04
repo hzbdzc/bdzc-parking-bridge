@@ -64,6 +64,13 @@ def test_filter_accepts_manual_passing_type() -> None:
     assert should_forward(manual_event) == (True, "")
 
 
+def test_filter_does_not_reject_unknown_passing_type() -> None:
+    """passingType is not part of auto-send filtering."""
+    event = replace(sample_event("20260412_063354_226439_body.bin"), passing_type="remoteControl")
+
+    assert should_forward(event) == (True, "")
+
+
 def test_filter_rejects_manual_without_plate() -> None:
     """manual 手动放行记录仍必须有有效车牌。"""
     manual_no_plate_event = replace(sample_event("20260412_113252_857892_body.bin"), passing_type="manual")

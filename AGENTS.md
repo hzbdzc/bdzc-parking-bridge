@@ -31,7 +31,7 @@
   - 停车场出入口事件
   - active 状态
   - 方向为 enter/exit
-  - passingType 为 plateRecognition / stop / manual
+  - 不根据 passingType 拦截发送
   - 车牌有效
   - 过车时间相对接收时间没有超过配置的过旧跳过秒数
 - 对需要发送的记录转换为大园区停车系统 API payload，并按业务要求反转方向：我方进场转换为对方出场，我方出场转换为对方进场
